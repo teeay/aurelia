@@ -1,0 +1,25 @@
+# This file is part of the Aurelia workspace.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aurelia"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Embeddable service mesh for Rust distributed applications."
+documentation = "https://docs.rs/aurelia"
+readme = "../../README.md"
+keywords = ["mesh", "service-mesh", "peering", "mtls", "distributed"]
+categories = ["network-programming", "asynchronous"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+aurelia-peering = { path = "../crates/peering" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

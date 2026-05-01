@@ -1,0 +1,32 @@
+# This file is part of the Aurelia workspace.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "2"
+members = [
+  "src/lib",
+  "src/crates/ids",
+  "src/crates/logging",
+  "src/crates/peering",
+  "src/crates/testing",
+  "src/crates/xtask",
+]
+exclude = ["publish"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/teeay/aurelia"
+homepage = "https://teeay.dev/aurelia"
+authors = ["teeay"]
+
+[workspace.metadata.aurelia-publish]
+target_crate = "aurelia"
+internal_crates = [
+  { name = "aurelia-ids" },
+  { name = "aurelia-logging" },
+  { name = "aurelia-peering" },
+]
+excluded_crates = ["aurelia-testing", "xtask"]

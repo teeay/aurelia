@@ -1,0 +1,19 @@
+# This file is part of the Aurelia workspace.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "peering-domus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aurelia = { path = "../../../../src/lib" }
+async-trait = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace]
