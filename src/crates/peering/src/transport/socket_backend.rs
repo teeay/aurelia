@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Zivatar Limited
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime,
@@ -24,12 +24,14 @@ use x509_parser::oid_registry::{
     OID_SIG_ED25519,
 };
 
-use crate::address::DomusAddr;
-use crate::auth::DomusAuthConfig;
-use crate::config::DomusConfigAccess;
+use crate::auth::Pkcs8AuthConfig;
+use crate::config::{DomusConfigAccess, MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL};
+use aurelia_data::DomusAddr;
 use aurelia_ids::{AureliaError, ErrorId};
 
 use super::backend::{AuthenticatedStream, TransportBackend};
+use super::callback_rendezvous::{CallbackRendezvous, CallbackSnapshot};
+use super::frame::wire_payload_len;
 use super::pkcs8::parse_pkcs8_auth_material;
 
 const AUTH_VERSION: u8 = 1;
@@ -41,25 +43,45 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 const NONCE_LEN: usize = 32;
 const PATH_MAX_LEN: usize = libc::PATH_MAX as usize;
 const SOCKET_FS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_CERT_CHAIN_LEN: usize = 16;
+type SocketAuthenticatedStream = AuthenticatedStream<UnixStream, DomusAddr>;
+type SocketAcceptedResult = Result<SocketAuthenticatedStream, AureliaError>;
 
+#[derive(Clone)]
 pub struct SocketBackend {
-    auth: RwLock<Arc<SocketAuthMaterial>>,
+    auth: Arc<RwLock<Arc<SocketAuthMaterial>>>,
     config: DomusConfigAccess,
     local_path: Arc<Mutex<Option<PathBuf>>>,
     preauth_gate: Arc<super::limits::PreAuthGate>,
-    pending_callbacks: Arc<Mutex<HashMap<Vec<u8>, oneshot::Sender<CallbackInfo>>>>,
+    pending_callbacks: Arc<SocketCallbackRendezvous>,
+    accepted_tx: mpsc::Sender<SocketAcceptedResult>,
+    accepted_rx: Arc<Mutex<mpsc::Receiver<SocketAcceptedResult>>>,
     rng: SystemRandom,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 struct SocketAuthMaterial {
-    cert_der: Vec<u8>,
+    cert_chain_der: Vec<Vec<u8>>,
     signer: LocalSigner,
     verifier: Arc<dyn ClientCertVerifier>,
 }
 
+#[derive(Debug)]
 struct CallbackInfo {
     origin_path: PathBuf,
+    destination_path: PathBuf,
     nonce_b_cb: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ExpectedSocketCallback {
+    expected_origin_path: PathBuf,
+    expected_destination_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct SocketCallbackRendezvous {
+    inner: CallbackRendezvous<Vec<u8>, ExpectedSocketCallback, CallbackInfo>,
 }
 
 enum LocalSigner {
@@ -69,64 +91,126 @@ enum LocalSigner {
     Ed25519(signature::Ed25519KeyPair),
 }
 
+impl SocketCallbackRendezvous {
+    fn new() -> Self {
+        Self {
+            inner: CallbackRendezvous::new(),
+        }
+    }
+
+    async fn register(
+        &self,
+        nonce_a_cb: Vec<u8>,
+        expected_origin_path: PathBuf,
+        expected_destination_path: PathBuf,
+    ) -> (oneshot::Receiver<CallbackInfo>, CallbackSnapshot) {
+        CallbackRendezvous::register(
+            &self.inner,
+            nonce_a_cb,
+            ExpectedSocketCallback {
+                expected_origin_path,
+                expected_destination_path,
+            },
+        )
+        .await
+    }
+
+    async fn cleanup(&self, nonce_a_cb: &[u8]) -> CallbackSnapshot {
+        CallbackRendezvous::cleanup(&self.inner, nonce_a_cb.to_vec()).await
+    }
+
+    async fn fulfill(
+        &self,
+        nonce_a_cb: &[u8],
+        info: CallbackInfo,
+    ) -> Result<CallbackSnapshot, AureliaError> {
+        let origin_path = info.origin_path.clone();
+        let destination_path = info.destination_path.clone();
+        CallbackRendezvous::fulfill(
+            &self.inner,
+            nonce_a_cb.to_vec(),
+            |expected| {
+                expected.expected_origin_path == origin_path
+                    && expected.expected_destination_path == destination_path
+            },
+            info,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+impl SocketCallbackRendezvous {
+    async fn pending_len(&self) -> usize {
+        self.inner.pending_len().await
+    }
+}
+
 impl SocketBackend {
+    async fn with_fs_timeout<T>(
+        op: impl Future<Output = std::io::Result<T>>,
+    ) -> Result<std::io::Result<T>, AureliaError> {
+        timeout(SOCKET_FS_TIMEOUT, op).await.map_err(|_| {
+            AureliaError::with_message(ErrorId::PeerUnavailable, "socket filesystem timeout")
+        })
+    }
+
     async fn path_exists(path: &Path) -> Result<bool, AureliaError> {
-        match timeout(SOCKET_FS_TIMEOUT, tokio::fs::metadata(path)).await {
-            Ok(Ok(_)) => Ok(true),
-            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Ok(Err(err)) => Err(AureliaError::with_message(
+        match Self::with_fs_timeout(tokio::fs::metadata(path)).await? {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(AureliaError::with_message(
                 ErrorId::ProtocolViolation,
                 err.to_string(),
             )),
-            Err(_) => Err(AureliaError::new(ErrorId::PeerUnavailable)),
         }
     }
 
     async fn canonicalize_path(path: &Path) -> Result<PathBuf, AureliaError> {
-        match timeout(SOCKET_FS_TIMEOUT, tokio::fs::canonicalize(path)).await {
-            Ok(Ok(canonical)) => Ok(canonical),
-            Ok(Err(err)) => Err(AureliaError::with_message(
+        match Self::with_fs_timeout(tokio::fs::canonicalize(path)).await? {
+            Ok(canonical) => Ok(canonical),
+            Err(err) => Err(AureliaError::with_message(
                 ErrorId::ProtocolViolation,
                 err.to_string(),
             )),
-            Err(_) => Err(AureliaError::new(ErrorId::PeerUnavailable)),
         }
     }
 
     async fn remove_socket_file(path: &Path) -> Result<(), AureliaError> {
-        match timeout(SOCKET_FS_TIMEOUT, tokio::fs::remove_file(path)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Ok(Err(err)) => Err(AureliaError::with_message(
+        match Self::with_fs_timeout(tokio::fs::remove_file(path)).await? {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(AureliaError::with_message(
                 ErrorId::PeerUnavailable,
                 err.to_string(),
             )),
-            Err(_) => Err(AureliaError::new(ErrorId::PeerUnavailable)),
         }
     }
 
     pub fn new(
-        auth: DomusAuthConfig,
+        auth: Pkcs8AuthConfig,
         config: DomusConfigAccess,
-        _runtime_handle: tokio::runtime::Handle,
+        runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, AureliaError> {
         let auth = parse_pkcs8_auth(auth)?;
+        let (accepted_tx, accepted_rx) = mpsc::channel(MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL);
         Ok(Self {
-            auth: RwLock::new(Arc::new(auth)),
+            auth: Arc::new(RwLock::new(Arc::new(auth))),
             config,
             local_path: Arc::new(Mutex::new(None)),
             preauth_gate: Arc::new(super::limits::PreAuthGate::new()),
-            pending_callbacks: Arc::new(Mutex::new(HashMap::new())),
+            pending_callbacks: Arc::new(SocketCallbackRendezvous::new()),
+            accepted_tx,
+            accepted_rx: Arc::new(Mutex::new(accepted_rx)),
             rng: SystemRandom::new(),
+            runtime_handle,
         })
     }
 
-    pub async fn reload_auth(&self, auth: DomusAuthConfig) -> Result<(), AureliaError> {
+    pub async fn reload_auth(&self, auth: Pkcs8AuthConfig) -> Result<(), AureliaError> {
         let auth = parse_pkcs8_auth(auth)?;
         let mut guard = self.auth.write().await;
         *guard = Arc::new(auth);
-        let mut pending = self.pending_callbacks.lock().await;
-        pending.clear();
         Ok(())
     }
 
@@ -185,26 +269,29 @@ impl SocketBackend {
     async fn register_pending_callback(
         &self,
         nonce_a_cb: Vec<u8>,
+        expected_origin_path: PathBuf,
+        expected_destination_path: PathBuf,
     ) -> oneshot::Receiver<CallbackInfo> {
-        let (tx, rx) = oneshot::channel();
-        let mut guard = self.pending_callbacks.lock().await;
-        guard.insert(nonce_a_cb, tx);
+        let (rx, _snapshot) = self
+            .pending_callbacks
+            .register(nonce_a_cb, expected_origin_path, expected_destination_path)
+            .await;
         rx
     }
 
     async fn clear_pending_callback(&self, nonce_a_cb: &[u8]) {
-        let mut guard = self.pending_callbacks.lock().await;
-        guard.remove(nonce_a_cb);
+        let _snapshot = self.pending_callbacks.cleanup(nonce_a_cb).await;
     }
 
-    async fn fulfill_callback(&self, nonce_a_cb: &[u8], info: CallbackInfo) -> bool {
-        let mut guard = self.pending_callbacks.lock().await;
-        if let Some(tx) = guard.remove(nonce_a_cb) {
-            let _ = tx.send(info);
-            true
-        } else {
-            false
-        }
+    async fn fulfill_callback(
+        &self,
+        nonce_a_cb: &[u8],
+        info: CallbackInfo,
+    ) -> Result<(), AureliaError> {
+        self.pending_callbacks
+            .fulfill(nonce_a_cb, info)
+            .await
+            .map(|_snapshot| ())
     }
 
     async fn read_first_message(&self, stream: &mut UnixStream) -> Result<Vec<u8>, AureliaError> {
@@ -219,12 +306,10 @@ impl SocketBackend {
         }
         let info = CallbackInfo {
             origin_path: msg.origin_path,
+            destination_path: msg.destination_path,
             nonce_b_cb: msg.nonce_b_cb,
         };
-        if !self.fulfill_callback(&msg.echo_nonce_a_cb, info).await {
-            return Err(AureliaError::new(ErrorId::ProtocolViolation));
-        }
-        Ok(())
+        self.fulfill_callback(&msg.echo_nonce_a_cb, info).await
     }
 
     async fn accept_inbound(
@@ -240,15 +325,8 @@ impl SocketBackend {
             self.handle_callback_message(&payload).await?;
             return Ok(None);
         }
-        let handshake_timeout = self.config.snapshot().await.socket_handshake_timeout;
         match msg_type {
-            MSG_AUTH_INIT => {
-                let result =
-                    timeout(handshake_timeout, self.handle_auth_init(stream, payload)).await;
-                result
-                    .map_err(|_| AureliaError::new(ErrorId::PeerUnavailable))?
-                    .map(Some)
-            }
+            MSG_AUTH_INIT => self.handle_auth_init(stream, payload).await.map(Some),
             _ => Err(AureliaError::new(ErrorId::ProtocolViolation)),
         }
     }
@@ -264,7 +342,7 @@ impl SocketBackend {
         if msg.destination_path != local {
             return Err(AureliaError::new(ErrorId::ProtocolViolation));
         }
-        self.verify_peer_cert(&auth, &msg.cert_der, &msg.origin_path)
+        self.verify_peer_cert(&auth, &msg.cert_chain_der, &msg.origin_path)
             .await?;
         let nonce_b = random_bytes(&self.rng, NONCE_LEN)?;
         let nonce_b_cb = random_bytes(&self.rng, NONCE_LEN)?;
@@ -277,7 +355,7 @@ impl SocketBackend {
         let challenge = AuthChallenge {
             origin_path: local.clone(),
             destination_path: msg.origin_path.clone(),
-            cert_der: auth.cert_der.clone(),
+            cert_chain_der: auth.cert_chain_der.clone(),
             nonce_b: nonce_b.clone(),
             signature,
         };
@@ -294,7 +372,7 @@ impl SocketBackend {
             &msg.origin_path,
             &local,
         )?;
-        self.verify_signature(&msg.cert_der, &proof_message, &proof.signature)?;
+        self.verify_signature(&msg.cert_chain_der[0], &proof_message, &proof.signature)?;
         Ok(AuthenticatedStream {
             stream,
             peer_addr: DomusAddr::Socket(msg.origin_path),
@@ -311,7 +389,9 @@ impl SocketBackend {
         let timeout_duration = self.config.snapshot().await.socket_callback_timeout;
         let stream = timeout(timeout_duration, UnixStream::connect(peer_path))
             .await
-            .map_err(|_| AureliaError::new(ErrorId::PeerUnavailable))?
+            .map_err(|_| {
+                AureliaError::with_message(ErrorId::PeerUnavailable, "socket callback timeout")
+            })?
             .map_err(|err| AureliaError::with_message(ErrorId::PeerUnavailable, err.to_string()))?;
         let msg = CallbackInit {
             origin_path: local_path.to_path_buf(),
@@ -327,6 +407,15 @@ impl SocketBackend {
 
     async fn outbound_handshake(
         &self,
+        stream: UnixStream,
+        peer_path: PathBuf,
+    ) -> Result<AuthenticatedStream<UnixStream, DomusAddr>, AureliaError> {
+        self.outbound_connect_back_handshake(stream, peer_path)
+            .await
+    }
+
+    async fn outbound_connect_back_handshake(
+        &self,
         mut stream: UnixStream,
         peer_path: PathBuf,
     ) -> Result<AuthenticatedStream<UnixStream, DomusAddr>, AureliaError> {
@@ -337,18 +426,23 @@ impl SocketBackend {
         let auth_init = AuthInit {
             origin_path: local.clone(),
             destination_path: peer_path.clone(),
-            cert_der: auth.cert_der.clone(),
+            cert_chain_der: auth.cert_chain_der.clone(),
             nonce_a: nonce_a.clone(),
             nonce_a_cb: nonce_a_cb.clone(),
         };
-        let callback_rx = self.register_pending_callback(nonce_a_cb.clone()).await;
+        let callback_rx = self
+            .register_pending_callback(nonce_a_cb.clone(), peer_path.clone(), local.clone())
+            .await;
         write_framed(&mut stream, &encode_auth_init(&auth_init)?).await?;
         let callback_timeout = self.config.snapshot().await.socket_callback_timeout;
         let callback = match timeout(callback_timeout, callback_rx).await {
             Ok(Ok(value)) => value,
             _ => {
                 self.clear_pending_callback(&nonce_a_cb).await;
-                return Err(AureliaError::new(ErrorId::PeerUnavailable));
+                return Err(AureliaError::with_message(
+                    ErrorId::PeerUnavailable,
+                    "socket callback timeout",
+                ));
             }
         };
         let challenge_payload = read_framed(&mut stream).await.map_err(|err| {
@@ -371,7 +465,7 @@ impl SocketBackend {
                 "challenge destination mismatch",
             ));
         }
-        self.verify_peer_cert(&auth, &challenge.cert_der, &challenge.origin_path)
+        self.verify_peer_cert(&auth, &challenge.cert_chain_der, &challenge.origin_path)
             .await
             .map_err(|err| {
                 AureliaError::with_message(err.kind, format!("verify peer cert: {err}"))
@@ -386,7 +480,7 @@ impl SocketBackend {
             AureliaError::with_message(err.kind, format!("challenge sig input: {err}"))
         })?;
         self.verify_signature(
-            &challenge.cert_der,
+            &challenge.cert_chain_der[0],
             &challenge_message,
             &challenge.signature,
         )
@@ -426,16 +520,25 @@ impl SocketBackend {
     async fn verify_peer_cert(
         &self,
         auth: &SocketAuthMaterial,
-        cert_der: &[u8],
+        cert_chain_der: &[Vec<u8>],
         expected_path: &Path,
     ) -> Result<(), AureliaError> {
-        let cert = CertificateDer::from(cert_der.to_vec());
+        let leaf = cert_chain_der
+            .first()
+            .ok_or_else(|| AureliaError::new(ErrorId::ProtocolViolation))?;
+        let cert = CertificateDer::from(leaf.clone());
+        let intermediates = cert_chain_der
+            .iter()
+            .skip(1)
+            .cloned()
+            .map(CertificateDer::from)
+            .collect::<Vec<_>>();
         auth.verifier
-            .verify_client_cert(&cert, &[], UnixTime::now())
+            .verify_client_cert(&cert, &intermediates, UnixTime::now())
             .map_err(|_| {
                 AureliaError::with_message(ErrorId::ProtocolViolation, "cert verify failed")
             })?;
-        let peer_path = extract_peer_uri_san_socket(cert_der).await?;
+        let peer_path = extract_peer_uri_san_socket(leaf).await?;
         if peer_path != expected_path {
             return Err(AureliaError::with_message(
                 ErrorId::ProtocolViolation,
@@ -482,12 +585,22 @@ impl SocketBackend {
         let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
             .map_err(|_| AureliaError::new(ErrorId::ProtocolViolation))?;
         let spki = &cert.tbs_certificate.subject_pki;
+        // Socket proof signatures bind peer identity through the validated leaf certificate:
+        // certificate validation proves the public key belongs to the expected socket URI SAN,
+        // and this check proves the peer owns the matching private key.
         let algo = signature_algorithm_for_cert(spki)?;
         let public_key_bytes = spki.subject_public_key.data.as_ref();
         let public_key = signature::UnparsedPublicKey::new(algo, public_key_bytes);
         public_key.verify(message, signature_bytes).map_err(|_| {
             AureliaError::with_message(ErrorId::ProtocolViolation, "signature verify failed")
         })
+    }
+}
+
+#[cfg(test)]
+impl SocketBackend {
+    fn accepted_queue_max_capacity(&self) -> usize {
+        self.accepted_tx.max_capacity()
     }
 }
 
@@ -527,19 +640,21 @@ impl TransportBackend for SocketBackend {
         listener: &mut Self::Listener,
     ) -> Result<AuthenticatedStream<Self::Stream, Self::Addr>, AureliaError> {
         loop {
-            let (mut stream, _) = listener.accept().await.map_err(|err| {
-                AureliaError::with_message(ErrorId::PeerUnavailable, err.to_string())
-            })?;
-            let permit = match self.preauth_gate.try_acquire(&self.config).await {
-                Some(permit) => permit,
-                None => {
-                    let _ = stream.shutdown().await;
-                    continue;
+            tokio::select! {
+                queued = async {
+                    let mut guard = self.accepted_rx.lock().await;
+                    guard.recv().await
+                } => {
+                    if let Some(result) = queued {
+                        return result;
+                    }
                 }
-            };
-            if let Some(authenticated) = self.accept_inbound(stream).await? {
-                drop(permit);
-                return Ok(authenticated);
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.map_err(|err| {
+                        AureliaError::with_message(ErrorId::PeerUnavailable, err.to_string())
+                    })?;
+                    self.spawn_accept_socket(stream);
+                }
             }
         }
     }
@@ -548,6 +663,36 @@ impl TransportBackend for SocketBackend {
         &self,
         peer: &Self::Addr,
     ) -> Result<AuthenticatedStream<Self::Stream, Self::Addr>, AureliaError> {
+        let handshake_timeout = self.config.snapshot().await.socket_handshake_timeout;
+        timeout(handshake_timeout, self.dial_inner(peer))
+            .await
+            .map_err(|_| {
+                AureliaError::with_message(ErrorId::PeerUnavailable, "socket handshake timeout")
+            })?
+    }
+}
+
+impl SocketBackend {
+    fn spawn_accept_socket(&self, stream: UnixStream) {
+        let backend = self.clone();
+        super::accept::InboundAuthContext::new(
+            &self.runtime_handle,
+            Arc::clone(&self.preauth_gate),
+            self.config.clone(),
+            self.accepted_tx.clone(),
+            "socket handshake timeout",
+        )
+        .spawn(
+            stream,
+            |config| config.socket_handshake_timeout,
+            move |stream| async move { backend.accept_inbound(stream).await },
+        );
+    }
+
+    async fn dial_inner(
+        &self,
+        peer: &DomusAddr,
+    ) -> Result<AuthenticatedStream<UnixStream, DomusAddr>, AureliaError> {
         let DomusAddr::Socket(path) = peer else {
             return Err(AureliaError::with_message(
                 ErrorId::PeerUnavailable,
@@ -558,19 +703,12 @@ impl TransportBackend for SocketBackend {
         let stream = UnixStream::connect(&peer_path)
             .await
             .map_err(|err| AureliaError::with_message(ErrorId::PeerUnavailable, err.to_string()))?;
-        let handshake_timeout = self.config.snapshot().await.socket_handshake_timeout;
-        let result = timeout(
-            handshake_timeout,
-            self.outbound_handshake(stream, peer_path),
-        )
-        .await;
-        result.map_err(|_| AureliaError::new(ErrorId::PeerUnavailable))?
+        self.outbound_handshake(stream, peer_path).await
     }
 }
 
-fn parse_pkcs8_auth(auth: DomusAuthConfig) -> Result<SocketAuthMaterial, AureliaError> {
-    let DomusAuthConfig::Pkcs8(pkcs8) = auth;
-    let material = parse_pkcs8_auth_material(pkcs8)?;
+fn parse_pkcs8_auth(auth: Pkcs8AuthConfig) -> Result<SocketAuthMaterial, AureliaError> {
+    let material = parse_pkcs8_auth_material(auth)?;
     let roots = material.roots;
     let certs = material.certs;
     let key_bytes = material.key_der;
@@ -586,13 +724,21 @@ fn parse_pkcs8_auth(auth: DomusAuthConfig) -> Result<SocketAuthMaterial, Aurelia
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_bytes.as_slice()));
     let signer = build_local_signer(&key_der)
         .ok_or_else(|| AureliaError::new(ErrorId::ProtocolViolation))?;
-    let cert = certs
-        .first()
-        .ok_or_else(|| AureliaError::new(ErrorId::ProtocolViolation))?
-        .as_ref()
-        .to_vec();
+    if certs.len() > MAX_CERT_CHAIN_LEN {
+        return Err(AureliaError::with_message(
+            ErrorId::ProtocolViolation,
+            "certificate chain too long",
+        ));
+    }
+    let cert_chain_der = certs
+        .into_iter()
+        .map(|cert| cert.as_ref().to_vec())
+        .collect::<Vec<_>>();
+    if cert_chain_der.is_empty() {
+        return Err(AureliaError::new(ErrorId::ProtocolViolation));
+    }
     Ok(SocketAuthMaterial {
-        cert_der: cert,
+        cert_chain_der,
         signer,
         verifier,
     })
@@ -674,6 +820,8 @@ fn signature_algorithm_for_cert(
     spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>,
 ) -> Result<&'static dyn signature::VerificationAlgorithm, AureliaError> {
     if spki.algorithm.algorithm == OID_PKCS1_RSAENCRYPTION {
+        // Socket RSA proofs are intentionally PSS/SHA-256. PKCS#1 v1.5 signatures are not
+        // accepted for the socket proof protocol.
         return Ok(&signature::RSA_PSS_2048_8192_SHA256);
     }
     if spki.algorithm.algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY {
@@ -791,7 +939,7 @@ async fn write_framed(stream: &mut UnixStream, payload: &[u8]) -> Result<(), Aur
     if payload.is_empty() || payload.len() > MAX_FRAME_LEN {
         return Err(AureliaError::new(ErrorId::ProtocolViolation));
     }
-    let len = (payload.len() as u32).to_be_bytes();
+    let len = wire_payload_len(payload.len())?.to_be_bytes();
     stream
         .write_all(&len)
         .await
@@ -810,7 +958,7 @@ async fn write_framed(stream: &mut UnixStream, payload: &[u8]) -> Result<(), Aur
 struct AuthInit {
     origin_path: PathBuf,
     destination_path: PathBuf,
-    cert_der: Vec<u8>,
+    cert_chain_der: Vec<Vec<u8>>,
     nonce_a: Vec<u8>,
     nonce_a_cb: Vec<u8>,
 }
@@ -825,7 +973,7 @@ struct CallbackInit {
 struct AuthChallenge {
     origin_path: PathBuf,
     destination_path: PathBuf,
-    cert_der: Vec<u8>,
+    cert_chain_der: Vec<Vec<u8>>,
     nonce_b: Vec<u8>,
     signature: Vec<u8>,
 }
@@ -846,12 +994,12 @@ fn encode_auth_init(msg: &AuthInit) -> Result<Vec<u8>, AureliaError> {
     buf.push(AUTH_VERSION);
     put_u16(&mut buf, origin.len() as u16);
     put_u16(&mut buf, dest.len() as u16);
-    put_u32(&mut buf, msg.cert_der.len() as u32);
+    put_cert_chain_header(&mut buf, &msg.cert_chain_der)?;
     put_u16(&mut buf, msg.nonce_a.len() as u16);
     put_u16(&mut buf, msg.nonce_a_cb.len() as u16);
     buf.extend_from_slice(&origin);
     buf.extend_from_slice(&dest);
-    buf.extend_from_slice(&msg.cert_der);
+    put_cert_chain_body(&mut buf, &msg.cert_chain_der);
     buf.extend_from_slice(&msg.nonce_a);
     buf.extend_from_slice(&msg.nonce_a_cb);
     Ok(buf)
@@ -866,7 +1014,7 @@ async fn parse_auth_init(payload: &[u8]) -> Result<AuthInit, AureliaError> {
     }
     let origin_len = cursor.read_u16()? as usize;
     let dest_len = cursor.read_u16()? as usize;
-    let cert_len = cursor.read_u32()? as usize;
+    let cert_lens = cursor.read_cert_lens()?;
     let nonce_len = cursor.read_u16()? as usize;
     let callback_len = cursor.read_u16()? as usize;
     if origin_len == 0
@@ -880,7 +1028,7 @@ async fn parse_auth_init(payload: &[u8]) -> Result<AuthInit, AureliaError> {
     }
     let origin = cursor.read_bytes(origin_len)?;
     let dest = cursor.read_bytes(dest_len)?;
-    let cert = cursor.read_bytes(cert_len)?;
+    let cert_chain = cursor.read_cert_chain(&cert_lens)?;
     let nonce_a = cursor.read_bytes(nonce_len)?;
     let nonce_a_cb = cursor.read_bytes(callback_len)?;
     if cursor.has_remaining() {
@@ -891,7 +1039,7 @@ async fn parse_auth_init(payload: &[u8]) -> Result<AuthInit, AureliaError> {
     Ok(AuthInit {
         origin_path,
         destination_path,
-        cert_der: cert,
+        cert_chain_der: cert_chain,
         nonce_a,
         nonce_a_cb,
     })
@@ -965,12 +1113,12 @@ fn encode_auth_challenge(msg: &AuthChallenge) -> Result<Vec<u8>, AureliaError> {
     buf.push(AUTH_VERSION);
     put_u16(&mut buf, origin.len() as u16);
     put_u16(&mut buf, dest.len() as u16);
-    put_u32(&mut buf, msg.cert_der.len() as u32);
+    put_cert_chain_header(&mut buf, &msg.cert_chain_der)?;
     put_u16(&mut buf, msg.nonce_b.len() as u16);
-    put_u32(&mut buf, msg.signature.len() as u32);
+    put_u32(&mut buf, wire_payload_len(msg.signature.len())?);
     buf.extend_from_slice(&origin);
     buf.extend_from_slice(&dest);
-    buf.extend_from_slice(&msg.cert_der);
+    put_cert_chain_body(&mut buf, &msg.cert_chain_der);
     buf.extend_from_slice(&msg.nonce_b);
     buf.extend_from_slice(&msg.signature);
     Ok(buf)
@@ -988,7 +1136,7 @@ async fn parse_auth_challenge(payload: &[u8]) -> Result<AuthChallenge, AureliaEr
     }
     let origin_len = cursor.read_u16()? as usize;
     let dest_len = cursor.read_u16()? as usize;
-    let cert_len = cursor.read_u32()? as usize;
+    let cert_lens = cursor.read_cert_lens()?;
     let nonce_len = cursor.read_u16()? as usize;
     let signature_len = cursor.read_u32()? as usize;
     if origin_len == 0
@@ -1004,7 +1152,7 @@ async fn parse_auth_challenge(payload: &[u8]) -> Result<AuthChallenge, AureliaEr
     }
     let origin = cursor.read_bytes(origin_len)?;
     let dest = cursor.read_bytes(dest_len)?;
-    let cert = cursor.read_bytes(cert_len)?;
+    let cert_chain = cursor.read_cert_chain(&cert_lens)?;
     let nonce_b = cursor.read_bytes(nonce_len)?;
     let signature = cursor.read_bytes(signature_len)?;
     if cursor.has_remaining() {
@@ -1018,7 +1166,7 @@ async fn parse_auth_challenge(payload: &[u8]) -> Result<AuthChallenge, AureliaEr
     Ok(AuthChallenge {
         origin_path,
         destination_path,
-        cert_der: cert,
+        cert_chain_der: cert_chain,
         nonce_b,
         signature,
     })
@@ -1032,7 +1180,7 @@ fn encode_auth_proof(msg: &AuthProof) -> Result<Vec<u8>, AureliaError> {
     buf.push(MSG_AUTH_PROOF);
     buf.push(AUTH_VERSION);
     put_u16(&mut buf, msg.echo_nonce_b_cb.len() as u16);
-    put_u32(&mut buf, msg.signature.len() as u32);
+    put_u32(&mut buf, wire_payload_len(msg.signature.len())?);
     buf.extend_from_slice(&msg.echo_nonce_b_cb);
     buf.extend_from_slice(&msg.signature);
     Ok(buf)
@@ -1112,6 +1260,28 @@ impl<'a> Cursor<'a> {
         Ok(value)
     }
 
+    fn read_cert_lens(&mut self) -> Result<Vec<usize>, AureliaError> {
+        let count = self.read_u16()? as usize;
+        if count == 0 || count > MAX_CERT_CHAIN_LEN {
+            return Err(AureliaError::with_message(
+                ErrorId::ProtocolViolation,
+                "certificate chain length invalid",
+            ));
+        }
+        let mut lens = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = self.read_u32()? as usize;
+            if len == 0 {
+                return Err(AureliaError::with_message(
+                    ErrorId::ProtocolViolation,
+                    "certificate length invalid",
+                ));
+            }
+            lens.push(len);
+        }
+        Ok(lens)
+    }
+
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, AureliaError> {
         if self.pos + len > self.data.len() {
             return Err(AureliaError::with_message(
@@ -1124,8 +1294,40 @@ impl<'a> Cursor<'a> {
         Ok(value)
     }
 
+    fn read_cert_chain(&mut self, lens: &[usize]) -> Result<Vec<Vec<u8>>, AureliaError> {
+        lens.iter()
+            .map(|len| self.read_bytes(*len))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     fn has_remaining(&self) -> bool {
         self.pos != self.data.len()
+    }
+}
+
+fn put_cert_chain_header(buf: &mut Vec<u8>, cert_chain: &[Vec<u8>]) -> Result<(), AureliaError> {
+    if cert_chain.is_empty() || cert_chain.len() > MAX_CERT_CHAIN_LEN {
+        return Err(AureliaError::with_message(
+            ErrorId::ProtocolViolation,
+            "certificate chain length invalid",
+        ));
+    }
+    put_u16(buf, cert_chain.len() as u16);
+    for cert in cert_chain {
+        if cert.is_empty() {
+            return Err(AureliaError::with_message(
+                ErrorId::ProtocolViolation,
+                "certificate length invalid",
+            ));
+        }
+        put_u32(buf, wire_payload_len(cert.len())?);
+    }
+    Ok(())
+}
+
+fn put_cert_chain_body(buf: &mut Vec<u8>, cert_chain: &[Vec<u8>]) {
+    for cert in cert_chain {
+        buf.extend_from_slice(cert);
     }
 }
 
@@ -1158,194 +1360,5 @@ async fn parse_path(value: Vec<u8>) -> Result<PathBuf, AureliaError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use crate::address::DomusAddr;
-    use crate::auth::{DomusAuthConfig, Pkcs8AuthConfig, Pkcs8DerConfig};
-    use crate::config::{DomusConfig, DomusConfigAccess};
-    use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, SanType};
-
-    fn build_ca() -> Certificate {
-        let mut params = CertificateParams::new(Vec::new());
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        Certificate::from_params(params).expect("ca cert")
-    }
-
-    fn build_domus_cert(ca: &Certificate, path: &Path) -> (Vec<u8>, Vec<u8>) {
-        let mut params = CertificateParams::new(Vec::new());
-        let uri = format!("aurelia+unix://{}", path.to_string_lossy());
-        params.subject_alt_names.push(SanType::URI(uri));
-        let cert = Certificate::from_params(params).expect("domus cert");
-        let cert_der = cert.serialize_der_with_signer(ca).expect("sign cert");
-        let key_der = cert.serialize_private_key_der();
-        (cert_der, key_der)
-    }
-
-    fn build_auth(ca: &Certificate, path: &Path) -> DomusAuthConfig {
-        let (cert_der, key_der) = build_domus_cert(ca, path);
-        DomusAuthConfig::Pkcs8(Pkcs8AuthConfig::Pkcs8Der(Pkcs8DerConfig {
-            ca_der: ca.serialize_der().expect("ca der"),
-            cert_der,
-            pkcs8_key_der: key_der,
-        }))
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let root = workspace_root().join("tmp/peering-socket-tests");
-        let dir = root.join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create temp dir");
-        fs::canonicalize(&dir).expect("canonicalize temp dir")
-    }
-
-    fn workspace_root() -> PathBuf {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest
-            .parent()
-            .and_then(|dir| dir.parent())
-            .and_then(|dir| dir.parent())
-            .map(PathBuf::from)
-            .expect("workspace root")
-    }
-
-    #[tokio::test]
-    async fn socket_connect_back_success() {
-        let dir = temp_dir("connect-back-success");
-        let path_a = dir.join("domus-a.sock");
-        let path_b = dir.join("domus-b.sock");
-
-        let ca = build_ca();
-        let auth_a = build_auth(&ca, &path_a);
-        let auth_b = build_auth(&ca, &path_b);
-
-        let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
-        let backend_a = Arc::new(
-            SocketBackend::new(auth_a, config.clone(), tokio::runtime::Handle::current())
-                .expect("backend a"),
-        );
-        let backend_b = Arc::new(
-            SocketBackend::new(auth_b, config.clone(), tokio::runtime::Handle::current())
-                .expect("backend b"),
-        );
-
-        let mut listener_a = backend_a
-            .bind(&DomusAddr::Socket(path_a.clone()))
-            .await
-            .expect("bind a");
-        let mut listener_b = backend_b
-            .bind(&DomusAddr::Socket(path_b.clone()))
-            .await
-            .expect("bind b");
-
-        let backend_a_accept = Arc::clone(&backend_a);
-        let accept_a = tokio::spawn(async move {
-            let _ = backend_a_accept.accept(&mut listener_a).await;
-        });
-        let backend_b_accept = Arc::clone(&backend_b);
-        let accept_b = tokio::spawn(async move {
-            backend_b_accept
-                .accept(&mut listener_b)
-                .await
-                .expect("accept b")
-        });
-
-        let outbound = backend_a
-            .dial(&DomusAddr::Socket(path_b.clone()))
-            .await
-            .expect("dial");
-        let addr = outbound.peer_addr;
-        drop(outbound.stream);
-        let inbound = accept_b.await.expect("accept task");
-        let peer_addr = inbound.peer_addr;
-        assert_eq!(addr, DomusAddr::Socket(path_b));
-        assert_eq!(peer_addr, DomusAddr::Socket(path_a));
-
-        accept_a.abort();
-    }
-
-    #[tokio::test]
-    async fn socket_callback_timeout_fails() {
-        let dir = temp_dir("callback-timeout");
-        let path_a = dir.join("domus-a.sock");
-        let path_b = dir.join("domus-b.sock");
-
-        let ca = build_ca();
-        let auth_a = build_auth(&ca, &path_a);
-        let auth_b = build_auth(&ca, &path_b);
-
-        let cfg = DomusConfig {
-            socket_callback_timeout: Duration::from_millis(50),
-            ..Default::default()
-        };
-        let config: DomusConfigAccess = DomusConfigAccess::from_config(cfg);
-        let backend_a = Arc::new(
-            SocketBackend::new(auth_a, config.clone(), tokio::runtime::Handle::current())
-                .expect("backend a"),
-        );
-        let backend_b = Arc::new(
-            SocketBackend::new(auth_b, config.clone(), tokio::runtime::Handle::current())
-                .expect("backend b"),
-        );
-
-        let _listener_a = backend_a
-            .bind(&DomusAddr::Socket(path_a.clone()))
-            .await
-            .expect("bind a");
-        let mut listener_b = backend_b
-            .bind(&DomusAddr::Socket(path_b.clone()))
-            .await
-            .expect("bind b");
-
-        let backend_b_accept = Arc::clone(&backend_b);
-        let accept_b = tokio::spawn(async move { backend_b_accept.accept(&mut listener_b).await });
-
-        let result = backend_a.dial(&DomusAddr::Socket(path_b)).await;
-        assert!(result.is_err());
-
-        let _ = accept_b.await;
-    }
-
-    #[tokio::test]
-    async fn auth_challenge_rejects_signature_length_overflow() {
-        let msg = AuthChallenge {
-            origin_path: PathBuf::from("/tmp/aurelia-auth-a.sock"),
-            destination_path: PathBuf::from("/tmp/aurelia-auth-b.sock"),
-            cert_der: vec![1, 2, 3],
-            nonce_b: vec![0u8; NONCE_LEN],
-            signature: vec![9; 4],
-        };
-        let mut payload = encode_auth_challenge(&msg).expect("encode");
-        let sig_len_offset = 12;
-        let bad_len = msg.signature.len() as u32 + 10;
-        payload[sig_len_offset..sig_len_offset + 4].copy_from_slice(&bad_len.to_be_bytes());
-
-        let err = match parse_auth_challenge(&payload).await {
-            Ok(_) => panic!("expected error"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind, ErrorId::ProtocolViolation);
-    }
-
-    #[test]
-    fn auth_proof_rejects_signature_length_overflow() {
-        let msg = AuthProof {
-            echo_nonce_b_cb: vec![0u8; NONCE_LEN],
-            signature: vec![3; 5],
-        };
-        let mut payload = encode_auth_proof(&msg).expect("encode");
-        let sig_len_offset = 4;
-        let bad_len = msg.signature.len() as u32 + 7;
-        payload[sig_len_offset..sig_len_offset + 4].copy_from_slice(&bad_len.to_be_bytes());
-
-        let err = match parse_auth_proof(&payload) {
-            Ok(_) => panic!("expected error"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind, ErrorId::ProtocolViolation);
-    }
-}
+#[path = "tests/leaf/socket_backend.rs"]
+mod tests;

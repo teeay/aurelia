@@ -28,8 +28,7 @@ where
                     Err(err) => {
                         inner
                             .observability
-                            .listener_failure(inner.local_addr.clone(), err.kind)
-                            .await;
+                            .listener_failure(inner.local_addr.clone(), err.kind);
                         warn!(error = %err, "listener accept failed");
                         continue;
                     }

@@ -4,22 +4,25 @@
 
 use super::*;
 
+mod callis_pool;
+mod inbound;
+mod lifecycle;
+mod outbound;
+mod reservations;
+
+use callis_pool::BlobCallisPool;
+use inbound::{BlobInboundState, BlobRecvChunkState, BlobRecvStream, PendingBlobRequest};
+use lifecycle::BlobLifecycleSnapshot;
+pub(super) use outbound::BlobWriteLease;
+use outbound::{
+    BlobOutboundState, BlobResponseLane, BlobWriteSlot, BlobWriteSlotState, InflightBlobFrame,
+};
+use reservations::BlobReservationState;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BlobCallisSettings {
     pub(super) chunk_size: u32,
     pub(super) ack_window_chunks: u32,
-}
-
-pub(super) struct PendingBlobRequest {
-    taberna_id: TabernaId,
-    receiver: Arc<BlobReceiverState>,
-}
-
-pub(super) struct BlobRecvStream {
-    taberna_id: TabernaId,
-    receiver: Arc<BlobReceiverState>,
-    pub(super) ring: Arc<crate::ring_buffer::InboundRingBuffer>,
-    pub(super) last_activity: Instant,
 }
 
 pub(crate) struct BlobReceiverState {
@@ -31,129 +34,92 @@ pub(crate) struct BlobReceiverState {
     pub(super) idle_timeout: Duration,
 }
 
+impl BlobReceiverState {
+    pub(super) async fn fail(&self, err: AureliaError) {
+        {
+            let mut guard = self.error.lock().await;
+            *guard = Some(err);
+        }
+        self.completed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum BlobChunkOutcome {
     Continue,
     Complete(PeerMessageId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RetainedBlobKind {
-    Start,
-    Chunk { chunk_id: u64 },
-}
-
-#[derive(Clone)]
-pub(super) struct RetainedBlobFrame {
-    stream_id: PeerMessageId,
-    kind: RetainedBlobKind,
-    frame: OutboundFrame,
-}
-
-pub(super) struct DispatchFrame {
-    pub(super) stream_id: PeerMessageId,
-    pub(super) peer_msg_id: PeerMessageId,
-    pub(super) frame: OutboundFrame,
-    pub(super) is_chunk: bool,
-    pub(super) retained_kind: Option<RetainedBlobKind>,
-}
-
-pub(super) struct BlobCallisPool {
-    order: VecDeque<CallisId>,
-    handles: HashMap<CallisId, CallisHandle>,
-    settings: HashMap<CallisId, BlobCallisSettings>,
-}
-
-pub(super) struct InflightBlobFrame {
-    stream_id: PeerMessageId,
-    callis_id: CallisId,
-    is_chunk: bool,
-}
-
-type RetainedReplayStart = Option<(PeerMessageId, OutboundFrame)>;
-type RetainedReplayChunks = BTreeMap<u64, (PeerMessageId, OutboundFrame)>;
-type RetainedReplayByStream = BTreeMap<PeerMessageId, (RetainedReplayStart, RetainedReplayChunks)>;
-
+/// Peer-level blob coordinator.
+///
+/// This is deliberately one manager with passive ownership domains underneath it. Blob state is
+/// cross-cutting at the peer level: primary callis messages establish blob transfers, blob callis
+/// carry the chunks, and shutdown/backpressure cleanup has to see both sides. The submodules keep
+/// the domains auditable; active work stays with the existing peer and callis tasks instead of a
+/// separate blob task or queue. Methods that need to wake another task return or collect the
+/// relevant data, drop the domain lock, and notify afterwards.
+///
+/// Locking invariant: never hold more than one BlobManager domain mutex at a time. Cross-domain
+/// methods snapshot under one lock, drop that guard, then proceed to the next domain or notify.
+/// If a future change needs atomic mutation across domains, that is a design change: merge the
+/// affected domains or introduce a reviewed transaction/actor shape instead of nesting locks.
 pub(super) struct BlobManager {
     callis: Mutex<BlobCallisPool>,
-    callis_notify: Notify,
-    dispatch_notify: Arc<Notify>,
+    // Callis-pool generation counter. Incremented on every add/remove/drain so consumers
+    // observe pool transitions via watch::Receiver::changed(), which is naturally latched
+    // and therefore race-free. See docs/concurrency.md Pattern 4.
+    callis_gen_tx: watch::Sender<u64>,
+    work_notify: Arc<Notify>,
+    inbound_idle_notify: Arc<Notify>,
     had_callis: AtomicBool,
-    outbound_streams: Mutex<HashMap<PeerMessageId, Arc<crate::ring_buffer::OutboundRingBuffer>>>,
-    inflight_map: Mutex<HashMap<PeerMessageId, InflightBlobFrame>>,
-    inflight_chunks: Mutex<HashMap<PeerMessageId, usize>>,
-    pub(super) retained: Mutex<HashMap<PeerMessageId, RetainedBlobFrame>>,
-    pending_requests: Mutex<HashMap<PeerMessageId, PendingBlobRequest>>,
-    pub(super) recv_streams: Mutex<HashMap<PeerMessageId, BlobRecvStream>>,
-    completed_streams: Mutex<HashSet<PeerMessageId>>,
-    completed_recv_streams: Mutex<HashMap<PeerMessageId, Instant>>,
-    pending_replay: Mutex<HashSet<PeerMessageId>>,
-    outbound_reservations: Mutex<HashMap<PeerMessageId, u64>>,
-    inbound_reservations: Mutex<HashMap<PeerMessageId, u64>>,
+    outbound: Mutex<BlobOutboundState>,
+    inbound: Mutex<BlobInboundState>,
+    reservations: Mutex<BlobReservationState>,
     buffer_tracker: Arc<BlobBufferTracker>,
     allocator: Arc<PeerMessageIdAllocator>,
-    stream_callis: Mutex<HashMap<PeerMessageId, CallisId>>,
-    callis_streams: Mutex<HashMap<CallisId, HashSet<PeerMessageId>>>,
-    stream_settings: Mutex<HashMap<PeerMessageId, BlobCallisSettings>>,
-    unassigned_streams: Mutex<HashSet<PeerMessageId>>,
-    outbound_rr: AtomicUsize,
 }
 
 impl BlobManager {
     pub(super) fn new(
         buffer_tracker: Arc<BlobBufferTracker>,
-        dispatch_notify: Arc<Notify>,
+        work_notify: Arc<Notify>,
         allocator: Arc<PeerMessageIdAllocator>,
+        initial_send_queue_size: usize,
     ) -> Self {
+        let (callis_gen_tx, _) = watch::channel(0u64);
         Self {
-            callis: Mutex::new(BlobCallisPool {
-                order: VecDeque::new(),
-                handles: HashMap::new(),
-                settings: HashMap::new(),
-            }),
-            callis_notify: Notify::new(),
-            dispatch_notify,
+            callis: Mutex::new(BlobCallisPool::new()),
+            callis_gen_tx,
+            work_notify,
+            inbound_idle_notify: Arc::new(Notify::new()),
             had_callis: AtomicBool::new(false),
-            outbound_streams: Mutex::new(HashMap::new()),
-            inflight_map: Mutex::new(HashMap::new()),
-            inflight_chunks: Mutex::new(HashMap::new()),
-            retained: Mutex::new(HashMap::new()),
-            pending_requests: Mutex::new(HashMap::new()),
-            recv_streams: Mutex::new(HashMap::new()),
-            completed_streams: Mutex::new(HashSet::new()),
-            completed_recv_streams: Mutex::new(HashMap::new()),
-            pending_replay: Mutex::new(HashSet::new()),
-            outbound_reservations: Mutex::new(HashMap::new()),
-            inbound_reservations: Mutex::new(HashMap::new()),
+            outbound: Mutex::new(BlobOutboundState::new(initial_send_queue_size)),
+            inbound: Mutex::new(BlobInboundState::new()),
+            reservations: Mutex::new(BlobReservationState::new()),
             buffer_tracker,
             allocator,
-            stream_callis: Mutex::new(HashMap::new()),
-            callis_streams: Mutex::new(HashMap::new()),
-            stream_settings: Mutex::new(HashMap::new()),
-            unassigned_streams: Mutex::new(HashSet::new()),
-            outbound_rr: AtomicUsize::new(0),
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn new_for_tests() -> Self {
-        Self::new(
-            Arc::new(BlobBufferTracker::default()),
-            Arc::new(Notify::new()),
-            Arc::new(PeerMessageIdAllocator::default()),
-        )
+    pub(super) fn notify_work(&self) {
+        self.work_notify.notify_one();
     }
 
-    pub(super) fn notify_dispatch(&self) {
-        self.dispatch_notify.notify_one();
+    pub(super) fn work_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.work_notify)
     }
 
-    pub(super) fn dispatch_handle(&self) -> Arc<Notify> {
-        Arc::clone(&self.dispatch_notify)
+    /// Returns a watch receiver tracking the callis-pool generation counter. Consumers
+    /// observe pool transitions by calling `changed()` on this receiver. Because watch
+    /// receivers are naturally latched against the latest value, this is race-free
+    /// regardless of registration timing.
+    pub(super) fn subscribe_callis_gen(&self) -> watch::Receiver<u64> {
+        self.callis_gen_tx.subscribe()
     }
 
-    pub(super) fn callis_notify(&self) -> &Notify {
-        &self.callis_notify
+    fn bump_callis_gen(&self) {
+        self.callis_gen_tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     pub(super) fn next_peer_msg_id(&self) -> PeerMessageId {
@@ -169,15 +135,15 @@ impl BlobManager {
         if !self.buffer_tracker.try_reserve_outbound(bytes, cap) {
             return false;
         }
-        let mut guard = self.outbound_reservations.lock().await;
-        guard.insert(stream_id, bytes);
+        let mut reservations = self.reservations.lock().await;
+        reservations.outbound.insert(stream_id, bytes);
         true
     }
 
     pub(super) async fn release_outbound(&self, stream_id: PeerMessageId) {
         let bytes = {
-            let mut guard = self.outbound_reservations.lock().await;
-            guard.remove(&stream_id)
+            let mut reservations = self.reservations.lock().await;
+            reservations.outbound.remove(&stream_id)
         };
         if let Some(bytes) = bytes {
             self.buffer_tracker.release_outbound(bytes);
@@ -193,187 +159,185 @@ impl BlobManager {
         if !self.buffer_tracker.try_reserve_inbound(bytes, cap) {
             return false;
         }
-        let mut guard = self.inbound_reservations.lock().await;
-        guard.insert(stream_id, bytes);
+        let mut reservations = self.reservations.lock().await;
+        reservations.inbound.insert(stream_id, bytes);
         true
     }
 
     pub(super) async fn release_inbound(&self, stream_id: PeerMessageId) {
         let bytes = {
-            let mut guard = self.inbound_reservations.lock().await;
-            guard.remove(&stream_id)
+            let mut reservations = self.reservations.lock().await;
+            reservations.inbound.remove(&stream_id)
         };
         if let Some(bytes) = bytes {
             self.buffer_tracker.release_inbound(bytes);
         }
     }
 
-    pub(super) async fn schedule_replay_for_streams<I>(&self, streams: I)
-    where
-        I: IntoIterator<Item = PeerMessageId>,
-    {
-        let mut pending = self.pending_replay.lock().await;
-        let mut changed = false;
-        for stream_id in streams {
-            if pending.insert(stream_id) {
-                changed = true;
-            }
-        }
-        drop(pending);
-        if changed {
-            self.notify_dispatch();
-        }
-    }
-
-    pub(super) async fn take_pending_replay_snapshot(&self) -> Vec<PeerMessageId> {
-        let pending = self.pending_replay.lock().await;
-        pending.iter().copied().collect()
-    }
-
-    pub(super) async fn next_replay_frame(&self) -> Option<DispatchFrame> {
-        let pending_streams = self.take_pending_replay_snapshot().await;
-        if pending_streams.is_empty() {
-            return None;
-        }
-        let inflight = {
-            let guard = self.inflight_map.lock().await;
-            guard.keys().copied().collect::<HashSet<_>>()
+    pub(super) async fn enqueue_blob_write(&self, write: BlobWriteLease) -> bool {
+        let peer_msg_id = write.peer_msg_id();
+        let stream_id = write.stream_id();
+        let mut outbound = self.outbound.lock().await;
+        let Some(lane) = write.lane() else {
+            return false;
         };
-        let pending_set: HashSet<PeerMessageId> = pending_streams.iter().copied().collect();
-        let mut per_stream: RetainedReplayByStream = BTreeMap::new();
-        let retained = self.retained.lock().await;
-        for (peer_msg_id, retained) in retained.iter() {
-            if inflight.contains(peer_msg_id) {
-                continue;
-            }
-            if !pending_set.contains(&retained.stream_id) {
-                continue;
-            }
-            let entry = per_stream
-                .entry(retained.stream_id)
-                .or_insert_with(|| (None, BTreeMap::new()));
-            match retained.kind {
-                RetainedBlobKind::Start => {
-                    entry.0 = Some((*peer_msg_id, retained.frame.clone()));
-                }
-                RetainedBlobKind::Chunk { chunk_id } => {
-                    entry
-                        .1
-                        .insert(chunk_id, (*peer_msg_id, retained.frame.clone()));
-                }
-            }
+        if outbound.write_slots.contains_key(&peer_msg_id) {
+            return false;
         }
-        drop(retained);
-        let mut empty_streams = Vec::new();
-        let mut selected: Option<(PeerMessageId, PeerMessageId, OutboundFrame)> = None;
-        let mut ordered_streams = pending_streams.clone();
-        ordered_streams.sort_unstable();
-        for stream_id in ordered_streams {
-            match per_stream.get(&stream_id) {
-                Some((start, chunks)) => {
-                    if let Some((peer_msg_id, frame)) = start {
-                        selected = Some((stream_id, *peer_msg_id, frame.clone()));
-                        break;
-                    }
-                    if let Some((_chunk_id, (peer_msg_id, frame))) = chunks.iter().next() {
-                        if !self.is_chunk_window_full(stream_id).await {
-                            selected = Some((stream_id, *peer_msg_id, frame.clone()));
-                            break;
-                        }
-                        continue;
-                    }
-                    empty_streams.push(stream_id);
-                }
-                None => empty_streams.push(stream_id),
-            }
+        if outbound.response_lane_len(lane) >= outbound.response_capacities.capacity(lane) {
+            warn!(peer_msg_id, "blob response lane full");
+            return false;
         }
-        if !empty_streams.is_empty() {
-            let mut pending = self.pending_replay.lock().await;
-            for stream_id in empty_streams {
-                pending.remove(&stream_id);
-            }
-        }
-        let (stream_id, peer_msg_id, frame) = selected?;
-        let is_chunk = matches!(
-            frame,
-            OutboundFrame::Control { msg_type, .. } if msg_type == MSG_BLOB_TRANSFER_CHUNK
-        );
-        if is_chunk && self.is_chunk_window_full(stream_id).await {
-            return None;
-        }
-        Some(DispatchFrame {
-            stream_id,
+        outbound.write_slots.insert(
             peer_msg_id,
-            frame,
-            is_chunk,
-            retained_kind: None,
-        })
+            BlobWriteSlot {
+                stream_id,
+                write,
+                state: BlobWriteSlotState::Ready,
+            },
+        );
+        outbound.response_lane_mut(lane).push_back(peer_msg_id);
+        drop(outbound);
+        self.notify_work();
+        true
     }
 
-    pub(super) async fn next_chunk_frame(&self) -> Option<DispatchFrame> {
+    pub(super) async fn next_blob_write_slot(&self, callis_id: CallisId) -> Option<BlobWriteLease> {
+        let mut outbound = self.outbound.lock().await;
+        for lane in [
+            BlobResponseLane::Ack,
+            BlobResponseLane::Error,
+            BlobResponseLane::Complete,
+        ] {
+            while let Some(peer_msg_id) = outbound.response_lane_mut(lane).pop_front() {
+                let Some(slot) = outbound.write_slots.get_mut(&peer_msg_id) else {
+                    continue;
+                };
+                if matches!(
+                    slot.state,
+                    BlobWriteSlotState::Ready | BlobWriteSlotState::ReplayReady { .. }
+                ) {
+                    slot.state = BlobWriteSlotState::Writing { callis_id };
+                    return Some(slot.write.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) async fn lease_next_blob_write(
+        &self,
+        callis_id: CallisId,
+    ) -> Option<BlobWriteLease> {
+        let write = if let Some(write) = self.next_blob_write_slot(callis_id).await {
+            write
+        } else {
+            self.next_chunk_frame(callis_id).await?
+        };
+        self.mark_dispatch_inflight(&write, callis_id).await;
+        if self.has_dispatchable_blob_write().await {
+            self.notify_work();
+        }
+        Some(write)
+    }
+
+    pub(super) async fn finish_blob_write_attempt(
+        &self,
+        write: &BlobWriteLease,
+        callis_id: CallisId,
+        result: Result<(), AureliaError>,
+    ) {
+        if result.is_err() {
+            self.rollback_dispatch_inflight(write, callis_id).await;
+        } else if !write.is_chunk() {
+            let mut outbound = self.outbound.lock().await;
+            outbound.write_slots.remove(&write.peer_msg_id());
+        }
+        self.notify_work();
+    }
+
+    pub(super) async fn next_chunk_frame(&self, callis_id: CallisId) -> Option<BlobWriteLease> {
         let streams = {
-            let guard = self.outbound_streams.lock().await;
-            guard
+            let outbound = self.outbound.lock().await;
+            let mut streams = outbound
+                .streams
                 .iter()
                 .map(|(stream_id, ring)| (*stream_id, Arc::clone(ring)))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            order_streams_from_cursor(&mut streams, outbound.round_robin_cursor);
+            streams
         };
         if streams.is_empty() {
             return None;
         }
-        let start = self.outbound_rr.load(Ordering::SeqCst);
-        let total = streams.len();
-        for offset in 0..total {
-            let idx = (start + offset) % total;
-            let (stream_id, ring) = &streams[idx];
-            if self.is_chunk_window_full(*stream_id).await {
-                continue;
+        if let Some(write) = self
+            .next_chunk_frame_from_streams(callis_id, &streams, true)
+            .await
+        {
+            if let Some(stream_id) = write.stream_id() {
+                self.advance_round_robin_cursor(stream_id).await;
             }
-            if !ring.is_sendable().await {
+            return Some(write);
+        }
+        let write = self
+            .next_chunk_frame_from_streams(callis_id, &streams, false)
+            .await;
+        if let Some(write) = write.as_ref() {
+            if let Some(stream_id) = write.stream_id() {
+                self.advance_round_robin_cursor(stream_id).await;
+            }
+        }
+        write
+    }
+
+    async fn next_chunk_frame_from_streams(
+        &self,
+        callis_id: CallisId,
+        streams: &[(PeerMessageId, Arc<crate::ring_buffer::OutboundRingBuffer>)],
+        replay: bool,
+    ) -> Option<BlobWriteLease> {
+        for (stream_id, ring) in streams {
+            let dispatchable = if replay {
+                ring.has_dispatchable_replay().await
+            } else {
+                ring.has_dispatchable_fresh().await
+            };
+            if !dispatchable {
                 continue;
             }
             let peer_msg_id = self.allocator.next();
-            let Some(chunk) = ring.take_next_chunk(peer_msg_id).await else {
+            let Some(lease) = ring
+                .lease_next_chunk_for_write(callis_id, peer_msg_id)
+                .await
+            else {
                 continue;
             };
-            let mut flags = BlobChunkFlags::empty();
-            if chunk.is_last {
-                flags |= BlobChunkFlags::LAST_CHUNK;
-            }
-            let payload = BlobTransferChunkPayload {
-                request_msg_id: *stream_id,
-                chunk_id: chunk.chunk_id,
-                flags,
-                chunk: chunk.data,
-            };
-            let frame = OutboundFrame::Control {
-                msg_type: MSG_BLOB_TRANSFER_CHUNK,
-                peer_msg_id,
-                payload: Bytes::from(payload.to_bytes()),
-            };
-            self.outbound_rr.store((idx + 1) % total, Ordering::SeqCst);
-            return Some(DispatchFrame {
+            return Some(BlobWriteLease::Chunk {
                 stream_id: *stream_id,
                 peer_msg_id,
-                frame,
-                is_chunk: true,
-                retained_kind: Some(RetainedBlobKind::Chunk {
-                    chunk_id: chunk.chunk_id,
-                }),
+                chunk: lease,
             });
         }
         None
     }
 
-    pub(super) async fn is_chunk_window_full(&self, stream_id: PeerMessageId) -> bool {
-        let Some(settings) = self.settings_for_stream(stream_id).await else {
-            return false;
-        };
-        if settings.ack_window_chunks == 0 {
+    async fn advance_round_robin_cursor(&self, stream_id: PeerMessageId) {
+        let mut outbound = self.outbound.lock().await;
+        outbound.round_robin_cursor = next_stream_after(&outbound.streams, stream_id);
+    }
+
+    async fn has_dispatchable_blob_write(&self) -> bool {
+        let outbound = self.outbound.lock().await;
+        if outbound.response_ready_count() > 0 {
             return true;
         }
-        let inflight = self.inflight_chunk_count(stream_id).await;
-        inflight as u32 >= settings.ack_window_chunks
+        let streams = outbound.streams.values().cloned().collect::<Vec<_>>();
+        for ring in streams {
+            if ring.has_dispatchable_replay().await || ring.has_dispatchable_fresh().await {
+                return true;
+            }
+        }
+        false
     }
 
     pub(super) async fn add_callis(
@@ -387,6 +351,22 @@ impl BlobManager {
             self.fail_all_streams(AureliaError::new(ErrorId::PeerRestarted))
                 .await;
         }
+        if resume {
+            let streams_to_fail = {
+                let outbound = self.outbound.lock().await;
+                outbound
+                    .stream_settings
+                    .iter()
+                    .filter_map(|(stream_id, stream_settings)| {
+                        (*stream_settings != settings).then_some(*stream_id)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for stream_id in streams_to_fail {
+                self.fail_stream(stream_id, AureliaError::new(ErrorId::PeerRestarted))
+                    .await;
+            }
+        }
         self.had_callis.store(true, Ordering::SeqCst);
         {
             let mut pool = self.callis.lock().await;
@@ -396,32 +376,21 @@ impl BlobManager {
                 pool.order.push_back(handle.id);
             }
         }
-        self.callis_notify.notify_waiters();
-        self.notify_dispatch();
-        if resume {
-            self.reassign_unassigned_streams(handle.id).await;
-        }
+        self.bump_callis_gen();
+        self.notify_work();
     }
 
     pub(super) async fn has_stream_state(&self) -> bool {
-        let outbound = self.outbound_streams.lock().await;
-        if !outbound.is_empty() {
+        let outbound = self.outbound.lock().await;
+        if !outbound.streams.is_empty() || !outbound.write_slots.is_empty() {
             return true;
         }
         drop(outbound);
-        let recv = self.recv_streams.lock().await;
-        if !recv.is_empty() {
-            return true;
-        }
-        drop(recv);
-        let retained = self.retained.lock().await;
-        !retained.is_empty()
+        let inbound = self.inbound.lock().await;
+        !inbound.recv_streams.is_empty()
     }
 
-    pub(super) async fn remove_callis(
-        &self,
-        callis_id: CallisId,
-    ) -> (Option<CallisHandle>, Vec<PeerMessageId>) {
+    pub(super) async fn remove_callis(&self, callis_id: CallisId) -> Option<CallisHandle> {
         let handle = {
             let mut pool = self.callis.lock().await;
             let handle = pool.handles.remove(&callis_id);
@@ -431,49 +400,19 @@ impl BlobManager {
             }
             handle
         };
-        let mut streams = Vec::new();
-        {
-            let mut callis_streams = self.callis_streams.lock().await;
-            if let Some(set) = callis_streams.remove(&callis_id) {
-                streams.extend(set);
-            }
-        }
-        if !streams.is_empty() {
-            let mut stream_callis = self.stream_callis.lock().await;
-            let mut unassigned = self.unassigned_streams.lock().await;
-            for stream_id in &streams {
-                stream_callis.remove(stream_id);
-                unassigned.insert(*stream_id);
-            }
-        }
-        (handle, streams)
+        self.bump_callis_gen();
+        handle
     }
 
-    pub(super) async fn drain_callis(&self) -> (Vec<CallisHandle>, Vec<PeerMessageId>) {
+    pub(super) async fn drain_callis(&self) -> Vec<CallisHandle> {
         let mut pool = self.callis.lock().await;
         let handles = pool.handles.values().cloned().collect::<Vec<_>>();
         pool.handles.clear();
         pool.settings.clear();
         pool.order.clear();
         drop(pool);
-        let streams = {
-            let mut callis_streams = self.callis_streams.lock().await;
-            let streams: Vec<PeerMessageId> = callis_streams
-                .values()
-                .flat_map(|set| set.iter().copied())
-                .collect();
-            callis_streams.clear();
-            streams
-        };
-        if !streams.is_empty() {
-            let mut stream_callis = self.stream_callis.lock().await;
-            let mut unassigned = self.unassigned_streams.lock().await;
-            for stream_id in &streams {
-                stream_callis.remove(stream_id);
-                unassigned.insert(*stream_id);
-            }
-        }
-        (handles, streams)
+        self.bump_callis_gen();
+        handles
     }
 
     pub(super) async fn has_callis(&self) -> bool {
@@ -523,68 +462,12 @@ impl BlobManager {
         None
     }
 
-    pub(super) async fn send_stream_error(
-        &self,
-        stream_id: PeerMessageId,
-        error: AureliaError,
-    ) -> Result<(), AureliaError> {
-        let payload = ErrorPayload::new(error.kind.as_u32(), error.to_string()).to_bytes();
-        let frame = OutboundFrame::Control {
-            msg_type: MSG_ERROR,
-            peer_msg_id: stream_id,
-            payload: Bytes::from(payload),
-        };
-        let Some((_callis_id, handle, _settings)) = self.select_callis().await else {
-            return Err(AureliaError::new(ErrorId::PeerUnavailable));
-        };
-        handle
-            .tx
-            .send(frame)
-            .await
-            .map_err(|_| AureliaError::new(ErrorId::PeerUnavailable))
-    }
-
-    pub(super) async fn take_available_callis(&self) -> Option<(CallisId, CallisHandle)> {
-        let mut pool = self.callis.lock().await;
-        let len = pool.order.len();
-        for _ in 0..len {
-            let Some(id) = pool.order.pop_front() else {
-                break;
-            };
-            let handle = match pool.handles.get(&id).cloned() {
-                Some(handle) => handle,
-                None => {
-                    pool.settings.remove(&id);
-                    continue;
-                }
-            };
-            if handle.tx.is_closed() {
-                pool.handles.remove(&id);
-                pool.settings.remove(&id);
-                continue;
-            }
-            pool.order.push_back(id);
-            if handle
-                .available
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some((id, handle));
-            }
-        }
-        None
-    }
-
-    pub(super) async fn settings_for_stream(
-        &self,
-        stream_id: PeerMessageId,
-    ) -> Option<BlobCallisSettings> {
-        let guard = self.stream_settings.lock().await;
-        guard.get(&stream_id).copied()
-    }
-
     pub(super) async fn wait_for_callis(&self, timeout: Duration) -> Result<(), AureliaError> {
         let deadline = Instant::now() + timeout;
+        // Subscribe BEFORE the first has_callis() check so any bump that fires
+        // between the subscribe and the check is observed by the next changed().
+        // See docs/concurrency.md Pattern 4 (watch primitive choice).
+        let mut rx = self.callis_gen_tx.subscribe();
         loop {
             if self.has_callis().await {
                 return Ok(());
@@ -593,10 +476,7 @@ impl BlobManager {
             if remaining.is_zero() {
                 return Err(AureliaError::new(ErrorId::SendTimeout));
             }
-            if tokio::time::timeout(remaining, self.callis_notify.notified())
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
                 return Err(AureliaError::new(ErrorId::SendTimeout));
             }
         }
@@ -605,169 +485,112 @@ impl BlobManager {
     pub(super) async fn register_outbound_stream(
         &self,
         stream_id: PeerMessageId,
-        callis_id: CallisId,
         settings: BlobCallisSettings,
     ) -> Result<Arc<crate::ring_buffer::OutboundRingBuffer>, AureliaError> {
         let ring = Arc::new(crate::ring_buffer::OutboundRingBuffer::new(
             settings.chunk_size as usize,
             settings.ack_window_chunks as usize,
         )?);
-        let mut guard = self.outbound_streams.lock().await;
-        guard.insert(stream_id, Arc::clone(&ring));
-        drop(guard);
-        let mut completed = self.completed_streams.lock().await;
-        let pending_complete = completed.remove(&stream_id);
-        drop(completed);
-        if pending_complete {
-            ring.mark_complete().await;
+        {
+            let mut outbound = self.outbound.lock().await;
+            outbound.streams.insert(stream_id, Arc::clone(&ring));
+            outbound.stream_settings.insert(stream_id, settings);
         }
-        let mut stream_callis = self.stream_callis.lock().await;
-        stream_callis.insert(stream_id, callis_id);
-        drop(stream_callis);
-        let mut stream_settings = self.stream_settings.lock().await;
-        stream_settings.insert(stream_id, settings);
-        drop(stream_settings);
-        let mut callis_streams = self.callis_streams.lock().await;
-        callis_streams
-            .entry(callis_id)
-            .or_insert_with(HashSet::new)
-            .insert(stream_id);
-        drop(callis_streams);
-        let mut unassigned = self.unassigned_streams.lock().await;
-        unassigned.remove(&stream_id);
         Ok(ring)
     }
 
     pub(super) async fn unregister_outbound_stream(&self, stream_id: PeerMessageId) {
         self.release_outbound(stream_id).await;
-        let mut streams = self.outbound_streams.lock().await;
-        let ring = streams.remove(&stream_id);
-        drop(streams);
+        let ring = {
+            let mut outbound = self.outbound.lock().await;
+            let ring = outbound.streams.remove(&stream_id);
+            outbound
+                .inflight
+                .retain(|_, entry| entry.stream_id != stream_id);
+            outbound
+                .write_slots
+                .retain(|_, slot| slot.stream_id != Some(stream_id));
+            outbound.prune_response_ready();
+            outbound.stream_settings.remove(&stream_id);
+            ring
+        };
         if let Some(ring) = ring {
             ring.close().await;
         }
-        let removed_chunks = {
-            let mut inflight = self.inflight_map.lock().await;
-            let mut removed = 0usize;
-            inflight.retain(|_, entry| {
-                if entry.stream_id == stream_id {
-                    if entry.is_chunk {
-                        removed += 1;
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            removed
-        };
-        if removed_chunks > 0 {
-            let mut counts = self.inflight_chunks.lock().await;
-            if let Some(count) = counts.get_mut(&stream_id) {
-                if *count <= removed_chunks {
-                    counts.remove(&stream_id);
-                } else {
-                    *count -= removed_chunks;
-                }
-            }
-        }
-        let mut retained = self.retained.lock().await;
-        retained.retain(|_, frame| frame.stream_id != stream_id);
-        drop(retained);
-        let callis_id = {
-            let mut stream_callis = self.stream_callis.lock().await;
-            stream_callis.remove(&stream_id)
-        };
-        let mut stream_settings = self.stream_settings.lock().await;
-        stream_settings.remove(&stream_id);
-        drop(stream_settings);
-        if let Some(callis_id) = callis_id {
-            let mut callis_streams = self.callis_streams.lock().await;
-            if let Some(set) = callis_streams.get_mut(&callis_id) {
-                set.remove(&stream_id);
-            }
-        }
-        let mut unassigned = self.unassigned_streams.lock().await;
-        unassigned.remove(&stream_id);
-        drop(unassigned);
-        let mut completed = self.completed_streams.lock().await;
-        completed.remove(&stream_id);
-        drop(completed);
-        let mut pending_replay = self.pending_replay.lock().await;
-        pending_replay.remove(&stream_id);
     }
 
-    pub(super) async fn track_inflight(
+    pub(super) async fn mark_dispatch_inflight(&self, write: &BlobWriteLease, callis_id: CallisId) {
+        let mut outbound = self.outbound.lock().await;
+        let peer_msg_id = write.peer_msg_id();
+        let stream_id = write.stream_id();
+        if let Some(slot) = outbound.write_slots.get_mut(&peer_msg_id) {
+            slot.state = BlobWriteSlotState::InFlight { callis_id };
+        }
+        if write.expects_ack() {
+            if let Some(stream_id) = stream_id {
+                outbound.inflight.insert(
+                    peer_msg_id,
+                    InflightBlobFrame {
+                        stream_id,
+                        callis_id,
+                        is_chunk: write.is_chunk(),
+                    },
+                );
+            }
+        }
+        // Advance chunk slots before the socket write so a fast peer ACK can always
+        // resolve the ring slot through the already-installed inflight lookup.
+        let chunk_write_lease = match write {
+            BlobWriteLease::Chunk { chunk, .. } => Some(chunk.clone()),
+            BlobWriteLease::Ack { .. }
+            | BlobWriteLease::Error { .. }
+            | BlobWriteLease::Finish { .. } => None,
+        };
+        let ring = stream_id.and_then(|stream_id| outbound.streams.get(&stream_id).cloned());
+        drop(outbound);
+        if let (Some(lease), Some(ring)) = (chunk_write_lease, ring) {
+            ring.mark_chunk_inflight(&lease).await;
+        }
+    }
+
+    pub(super) async fn rollback_dispatch_inflight(
+        &self,
+        write: &BlobWriteLease,
+        callis_id: CallisId,
+    ) {
+        let mut outbound = self.outbound.lock().await;
+        let peer_msg_id = write.peer_msg_id();
+        let stream_id = write.stream_id();
+        if write.expects_ack() {
+            outbound.inflight.remove(&peer_msg_id);
+        }
+        if !write.is_chunk() {
+            if let Some(slot) = outbound.write_slots.get_mut(&peer_msg_id) {
+                slot.state = BlobWriteSlotState::ReplayReady {
+                    previous_callis_id: callis_id,
+                };
+                if let Some(lane) = slot.write.lane() {
+                    outbound.response_lane_mut(lane).push_back(peer_msg_id);
+                }
+            }
+        }
+        let should_replay_chunk = write.is_chunk();
+        let ring = stream_id.and_then(|stream_id| outbound.streams.get(&stream_id).cloned());
+        drop(outbound);
+        if should_replay_chunk {
+            let Some(ring) = ring else {
+                return;
+            };
+            ring.mark_callis_replay_ready(callis_id).await;
+        }
+    }
+
+    pub(super) async fn stream_ring(
         &self,
         stream_id: PeerMessageId,
-        peer_msg_id: PeerMessageId,
-        callis_id: CallisId,
-        is_chunk: bool,
-    ) {
-        let mut guard = self.inflight_map.lock().await;
-        guard.insert(
-            peer_msg_id,
-            InflightBlobFrame {
-                stream_id,
-                callis_id,
-                is_chunk,
-            },
-        );
-        drop(guard);
-        if is_chunk {
-            let mut counts = self.inflight_chunks.lock().await;
-            let entry = counts.entry(stream_id).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
-    }
-
-    pub(super) async fn inflight_chunk_count(&self, stream_id: PeerMessageId) -> usize {
-        let counts = self.inflight_chunks.lock().await;
-        counts.get(&stream_id).copied().unwrap_or(0)
-    }
-
-    async fn release_inflight_chunk(&self, stream_id: PeerMessageId) {
-        let mut counts = self.inflight_chunks.lock().await;
-        if let Some(count) = counts.get_mut(&stream_id) {
-            if *count <= 1 {
-                counts.remove(&stream_id);
-            } else {
-                *count -= 1;
-            }
-        }
-    }
-
-    pub(super) async fn retain_frame(
-        &self,
-        stream_id: PeerMessageId,
-        peer_msg_id: PeerMessageId,
-        kind: RetainedBlobKind,
-        frame: OutboundFrame,
-    ) {
-        let mut guard = self.retained.lock().await;
-        guard.insert(
-            peer_msg_id,
-            RetainedBlobFrame {
-                stream_id,
-                kind,
-                frame,
-            },
-        );
-    }
-
-    pub(super) async fn release_frame(&self, peer_msg_id: PeerMessageId) {
-        let mut guard = self.retained.lock().await;
-        guard.remove(&peer_msg_id);
-    }
-
-    pub(super) async fn callis_entry(
-        &self,
-        callis_id: CallisId,
-    ) -> Option<(CallisHandle, BlobCallisSettings)> {
-        let pool = self.callis.lock().await;
-        let handle = pool.handles.get(&callis_id).cloned()?;
-        let settings = *pool.settings.get(&callis_id)?;
-        Some((handle, settings))
+    ) -> Option<Arc<crate::ring_buffer::OutboundRingBuffer>> {
+        let outbound = self.outbound.lock().await;
+        outbound.streams.get(&stream_id).cloned()
     }
 
     pub(super) async fn settings_for_callis(
@@ -778,184 +601,73 @@ impl BlobManager {
         pool.settings.get(&callis_id).copied()
     }
 
-    pub(super) async fn assign_stream_to_callis(
-        &self,
-        stream_id: PeerMessageId,
-        callis_id: CallisId,
-        settings: BlobCallisSettings,
-    ) {
-        let mut stream_callis = self.stream_callis.lock().await;
-        stream_callis.insert(stream_id, callis_id);
-        drop(stream_callis);
-        let mut callis_streams = self.callis_streams.lock().await;
-        callis_streams
-            .entry(callis_id)
-            .or_insert_with(HashSet::new)
-            .insert(stream_id);
-        drop(callis_streams);
-        let mut stream_settings = self.stream_settings.lock().await;
-        stream_settings.entry(stream_id).or_insert(settings);
-        drop(stream_settings);
-        let mut unassigned = self.unassigned_streams.lock().await;
-        unassigned.remove(&stream_id);
-    }
-
-    pub(super) async fn reassign_unassigned_streams(&self, callis_id: CallisId) {
-        let Some((_handle, settings)) = self.callis_entry(callis_id).await else {
-            return;
-        };
-        let streams: Vec<PeerMessageId> = {
-            let guard = self.unassigned_streams.lock().await;
-            guard.iter().copied().collect()
-        };
-        if streams.is_empty() {
-            return;
-        }
-        let mut replay = HashSet::new();
-        for stream_id in streams {
-            if let Some(prev_settings) = self.settings_for_stream(stream_id).await {
-                if prev_settings != settings {
-                    self.fail_stream(stream_id, AureliaError::new(ErrorId::PeerRestarted))
-                        .await;
-                    continue;
-                }
-            }
-            self.assign_stream_to_callis(stream_id, callis_id, settings)
-                .await;
-            replay.insert(stream_id);
-        }
-        if !replay.is_empty() {
-            self.schedule_replay_for_streams(replay).await;
-        }
-    }
-
-    pub(super) async fn reassign_streams(&self, streams: Vec<PeerMessageId>) {
-        if streams.is_empty() {
-            return;
-        }
-        let mut replay_map: HashMap<CallisId, HashSet<PeerMessageId>> = HashMap::new();
-        for stream_id in streams {
-            let Some((callis_id, _handle, settings)) = self.select_callis().await else {
-                let mut unassigned = self.unassigned_streams.lock().await;
-                unassigned.insert(stream_id);
-                continue;
-            };
-            if let Some(prev_settings) = self.settings_for_stream(stream_id).await {
-                if prev_settings != settings {
-                    self.fail_stream(stream_id, AureliaError::new(ErrorId::PeerRestarted))
-                        .await;
-                    continue;
-                }
-            }
-            self.assign_stream_to_callis(stream_id, callis_id, settings)
-                .await;
-            replay_map.entry(callis_id).or_default().insert(stream_id);
-        }
-        for (callis_id, streams) in replay_map {
-            if self.callis_entry(callis_id).await.is_some() {
-                self.schedule_replay_for_streams(streams).await;
-            }
-        }
+    pub(super) async fn current_settings(&self) -> Option<BlobCallisSettings> {
+        let pool = self.callis.lock().await;
+        pool.order
+            .front()
+            .and_then(|callis_id| pool.settings.get(callis_id).copied())
     }
 
     pub(super) async fn fail_stream(&self, stream_id: PeerMessageId, error: AureliaError) {
         self.release_outbound(stream_id).await;
         let ring = {
-            let mut outbound = self.outbound_streams.lock().await;
-            outbound.remove(&stream_id)
+            let mut outbound = self.outbound.lock().await;
+            let ring = outbound.streams.remove(&stream_id);
+            outbound
+                .inflight
+                .retain(|_, entry| entry.stream_id != stream_id);
+            outbound
+                .write_slots
+                .retain(|_, slot| slot.stream_id != Some(stream_id));
+            outbound.prune_response_ready();
+            outbound.stream_settings.remove(&stream_id);
+            ring
         };
         if let Some(ring) = ring {
             ring.fail(error.clone()).await;
             ring.close().await;
         }
-        let removed_chunks = {
-            let mut inflight = self.inflight_map.lock().await;
-            let mut removed = 0usize;
-            inflight.retain(|_, entry| {
-                if entry.stream_id == stream_id {
-                    if entry.is_chunk {
-                        removed += 1;
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            removed
-        };
-        if removed_chunks > 0 {
-            let mut counts = self.inflight_chunks.lock().await;
-            if let Some(count) = counts.get_mut(&stream_id) {
-                if *count <= removed_chunks {
-                    counts.remove(&stream_id);
-                } else {
-                    *count -= removed_chunks;
-                }
-            }
-        }
-        let mut retained = self.retained.lock().await;
-        retained.retain(|_, frame| frame.stream_id != stream_id);
-        drop(retained);
-        let mut stream_callis = self.stream_callis.lock().await;
-        let callis_id = stream_callis.remove(&stream_id);
-        drop(stream_callis);
-        let mut stream_settings = self.stream_settings.lock().await;
-        stream_settings.remove(&stream_id);
-        drop(stream_settings);
-        let mut unassigned = self.unassigned_streams.lock().await;
-        unassigned.remove(&stream_id);
-        drop(unassigned);
-        let mut completed = self.completed_streams.lock().await;
-        completed.remove(&stream_id);
-        drop(completed);
-        let mut pending_replay = self.pending_replay.lock().await;
-        pending_replay.remove(&stream_id);
-        drop(pending_replay);
-        if let Some(callis_id) = callis_id {
-            let mut callis_streams = self.callis_streams.lock().await;
-            if let Some(set) = callis_streams.get_mut(&callis_id) {
-                set.remove(&stream_id);
-            }
-        }
     }
 
     pub(super) async fn handle_ack(&self, peer_msg_id: PeerMessageId) {
-        let entry = {
-            let mut guard = self.inflight_map.lock().await;
-            guard.remove(&peer_msg_id)
+        let (entry, ring) = {
+            let mut outbound = self.outbound.lock().await;
+            let entry = outbound.inflight.remove(&peer_msg_id);
+            outbound.write_slots.remove(&peer_msg_id);
+            let ring = if let Some(entry) = entry.as_ref() {
+                outbound.streams.get(&entry.stream_id).cloned()
+            } else {
+                None
+            };
+            (entry, ring)
         };
-        self.release_frame(peer_msg_id).await;
         let Some(entry) = entry else {
             return;
         };
         if entry.is_chunk {
-            self.release_inflight_chunk(entry.stream_id).await;
-            self.notify_dispatch();
+            self.notify_work();
         }
-        let ring = {
-            let guard = self.outbound_streams.lock().await;
-            guard.get(&entry.stream_id).cloned()
-        };
         if let Some(ring) = ring {
             ring.note_ack(peer_msg_id).await;
         }
     }
 
     pub(super) async fn handle_error(&self, peer_msg_id: PeerMessageId, error: AureliaError) {
-        let entry = {
-            let mut guard = self.inflight_map.lock().await;
-            guard.remove(&peer_msg_id)
+        let (entry, ring) = {
+            let mut outbound = self.outbound.lock().await;
+            let entry = outbound.inflight.remove(&peer_msg_id);
+            outbound.write_slots.remove(&peer_msg_id);
+            let ring = if let Some(entry) = entry.as_ref() {
+                outbound.streams.get(&entry.stream_id).cloned()
+            } else {
+                None
+            };
+            (entry, ring)
         };
-        self.release_frame(peer_msg_id).await;
         if let Some(entry) = entry {
             if entry.is_chunk {
-                self.release_inflight_chunk(entry.stream_id).await;
-                self.notify_dispatch();
+                self.notify_work();
             }
-            let ring = {
-                let guard = self.outbound_streams.lock().await;
-                guard.get(&entry.stream_id).cloned()
-            };
             if let Some(ring) = ring {
                 ring.note_error(peer_msg_id, error).await;
             }
@@ -971,8 +683,8 @@ impl BlobManager {
 
     async fn fail_outbound_stream(&self, stream_id: PeerMessageId, error: AureliaError) -> bool {
         let ring = {
-            let guard = self.outbound_streams.lock().await;
-            guard.get(&stream_id).cloned()
+            let outbound = self.outbound.lock().await;
+            outbound.streams.get(&stream_id).cloned()
         };
         let Some(ring) = ring else {
             return false;
@@ -982,76 +694,58 @@ impl BlobManager {
         true
     }
 
-    async fn fail_inbound_stream(&self, stream_id: PeerMessageId, error: AureliaError) -> bool {
+    pub(super) async fn fail_inbound_stream(
+        &self,
+        stream_id: PeerMessageId,
+        error: AureliaError,
+    ) -> bool {
         let pending = {
-            let mut guard = self.pending_requests.lock().await;
-            guard.remove(&stream_id)
+            let mut inbound = self.inbound.lock().await;
+            inbound.pending_requests.remove(&stream_id)
         };
         if let Some(pending) = pending {
-            {
-                let mut guard = pending.receiver.error.lock().await;
-                *guard = Some(error);
-            }
-            pending.receiver.completed.store(true, Ordering::SeqCst);
-            pending.receiver.notify.notify_waiters();
+            pending.receiver.fail(error).await;
             self.release_inbound(stream_id).await;
             return true;
         }
 
         if let Some(stream) = self.remove_recv_stream(stream_id).await {
-            {
-                let mut guard = stream.receiver.error.lock().await;
-                *guard = Some(error);
-            }
-            stream.receiver.completed.store(true, Ordering::SeqCst);
-            stream.receiver.notify.notify_waiters();
+            stream.receiver.fail(error).await;
             return true;
         }
         false
     }
 
-    pub(super) async fn handle_complete(&self, stream_id: PeerMessageId) {
+    pub(super) async fn handle_complete(
+        &self,
+        stream_id: PeerMessageId,
+    ) -> Result<(), AureliaError> {
         let ring = {
-            let guard = self.outbound_streams.lock().await;
-            guard.get(&stream_id).cloned()
+            let outbound = self.outbound.lock().await;
+            outbound.streams.get(&stream_id).cloned()
         };
         if let Some(ring) = ring {
             ring.mark_complete().await;
+            Ok(())
         } else {
-            self.stash_complete(stream_id).await;
+            Err(AureliaError::new(ErrorId::ProtocolViolation))
         }
-    }
-
-    pub(super) async fn stash_complete(&self, stream_id: PeerMessageId) {
-        let mut completed = self.completed_streams.lock().await;
-        completed.insert(stream_id);
     }
 
     pub(super) async fn note_recv_complete(&self, stream_id: PeerMessageId, ttl: Duration) {
         let now = Instant::now();
-        let mut completed = self.completed_recv_streams.lock().await;
-        completed.retain(|_, ts| now.duration_since(*ts) <= ttl);
-        completed.insert(stream_id, now);
-    }
-
-    pub(super) async fn recently_completed(&self, stream_id: PeerMessageId, ttl: Duration) -> bool {
-        let now = Instant::now();
-        let mut completed = self.completed_recv_streams.lock().await;
-        match completed.get(&stream_id).copied() {
-            Some(ts) if now.duration_since(ts) <= ttl => true,
-            Some(_) => {
-                completed.remove(&stream_id);
-                false
-            }
-            None => false,
-        }
+        let mut inbound = self.inbound.lock().await;
+        inbound
+            .completed_recv_streams
+            .retain(|_, ts| now.duration_since(*ts) <= ttl);
+        inbound.completed_recv_streams.insert(stream_id, now);
     }
 
     pub(super) async fn requeue_inflight_for_callis(&self, callis_id: CallisId) {
         let inflight_entries = {
-            let mut guard = self.inflight_map.lock().await;
+            let mut outbound = self.outbound.lock().await;
             let mut entries = Vec::new();
-            guard.retain(|peer_msg_id, entry| {
+            outbound.inflight.retain(|peer_msg_id, entry| {
                 if entry.callis_id == callis_id {
                     entries.push((*peer_msg_id, entry.stream_id, entry.is_chunk));
                     false
@@ -1059,75 +753,111 @@ impl BlobManager {
                     true
                 }
             });
+            let response_ids = outbound
+                .write_slots
+                .iter_mut()
+                .filter_map(|(peer_msg_id, slot)| match slot.state {
+                    BlobWriteSlotState::Writing {
+                        callis_id: slot_callis_id,
+                    }
+                    | BlobWriteSlotState::InFlight {
+                        callis_id: slot_callis_id,
+                    } if slot_callis_id == callis_id => {
+                        slot.state = BlobWriteSlotState::ReplayReady {
+                            previous_callis_id: callis_id,
+                        };
+                        Some((*peer_msg_id, slot.write.lane()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (peer_msg_id, lane) in response_ids {
+                if let Some(lane) = lane {
+                    outbound.response_lane_mut(lane).push_back(peer_msg_id);
+                }
+            }
             entries
         };
         if inflight_entries.is_empty() {
             return;
-        }
-        {
-            let mut removed: HashMap<PeerMessageId, usize> = HashMap::new();
-            for (_, stream_id, is_chunk) in &inflight_entries {
-                if *is_chunk {
-                    *removed.entry(*stream_id).or_insert(0) += 1;
-                }
-            }
-            let mut counts = self.inflight_chunks.lock().await;
-            for (stream_id, removed_count) in removed {
-                if let Some(count) = counts.get_mut(&stream_id) {
-                    if *count <= removed_count {
-                        counts.remove(&stream_id);
-                    } else {
-                        *count -= removed_count;
-                    }
-                }
-            }
         }
         let mut streams = HashSet::new();
         for (_peer_msg_id, stream_id, _is_chunk) in inflight_entries {
             streams.insert(stream_id);
         }
         if !streams.is_empty() {
-            self.schedule_replay_for_streams(streams).await;
+            let rings = {
+                let outbound = self.outbound.lock().await;
+                streams
+                    .iter()
+                    .filter_map(|stream_id| outbound.streams.get(stream_id).cloned())
+                    .collect::<Vec<_>>()
+            };
+            for ring in rings {
+                ring.mark_callis_replay_ready(callis_id).await;
+            }
+            self.notify_work();
         }
     }
 
     pub(super) async fn requeue_all_inflight(&self) {
         let inflight_entries = {
-            let mut guard = self.inflight_map.lock().await;
-            let entries: Vec<(PeerMessageId, PeerMessageId, bool)> = guard
+            let mut outbound = self.outbound.lock().await;
+            let entries: Vec<(PeerMessageId, PeerMessageId, CallisId, bool)> = outbound
+                .inflight
                 .iter()
-                .map(|(peer_msg_id, entry)| (*peer_msg_id, entry.stream_id, entry.is_chunk))
+                .map(|(peer_msg_id, entry)| {
+                    (
+                        *peer_msg_id,
+                        entry.stream_id,
+                        entry.callis_id,
+                        entry.is_chunk,
+                    )
+                })
                 .collect();
-            guard.clear();
+            outbound.inflight.clear();
+            let response_ids = outbound
+                .write_slots
+                .iter_mut()
+                .filter_map(|(peer_msg_id, slot)| match slot.state {
+                    BlobWriteSlotState::Writing { callis_id }
+                    | BlobWriteSlotState::InFlight { callis_id } => {
+                        slot.state = BlobWriteSlotState::ReplayReady {
+                            previous_callis_id: callis_id,
+                        };
+                        Some((*peer_msg_id, slot.write.lane()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (peer_msg_id, lane) in response_ids {
+                if let Some(lane) = lane {
+                    outbound.response_lane_mut(lane).push_back(peer_msg_id);
+                }
+            }
             entries
         };
         if inflight_entries.is_empty() {
             return;
         }
-        {
-            let mut removed: HashMap<PeerMessageId, usize> = HashMap::new();
-            for (_, stream_id, is_chunk) in &inflight_entries {
-                if *is_chunk {
-                    *removed.entry(*stream_id).or_insert(0) += 1;
-                }
-            }
-            let mut counts = self.inflight_chunks.lock().await;
-            for (stream_id, removed_count) in removed {
-                if let Some(count) = counts.get_mut(&stream_id) {
-                    if *count <= removed_count {
-                        counts.remove(&stream_id);
-                    } else {
-                        *count -= removed_count;
-                    }
-                }
-            }
-        }
         let mut streams = HashSet::new();
-        for (_peer_msg_id, stream_id, _is_chunk) in inflight_entries {
+        let mut ring_replay: HashMap<CallisId, Vec<Arc<crate::ring_buffer::OutboundRingBuffer>>> =
+            HashMap::new();
+        for (_peer_msg_id, stream_id, callis_id, is_chunk) in inflight_entries {
+            if is_chunk {
+                if let Some(ring) = self.stream_ring(stream_id).await {
+                    ring_replay.entry(callis_id).or_default().push(ring);
+                }
+            }
             streams.insert(stream_id);
         }
+        for (callis_id, rings) in ring_replay {
+            for ring in rings {
+                ring.mark_callis_replay_ready(callis_id).await;
+            }
+        }
         if !streams.is_empty() {
-            self.schedule_replay_for_streams(streams).await;
+            self.notify_work();
         }
     }
 
@@ -1137,8 +867,8 @@ impl BlobManager {
         taberna_id: TabernaId,
         receiver: Arc<BlobReceiverState>,
     ) {
-        let mut guard = self.pending_requests.lock().await;
-        guard.insert(
+        let mut inbound = self.inbound.lock().await;
+        inbound.pending_requests.insert(
             stream_id,
             PendingBlobRequest {
                 taberna_id,
@@ -1147,18 +877,49 @@ impl BlobManager {
         );
     }
 
+    pub(super) async fn activate_pending_request(
+        &self,
+        stream_id: PeerMessageId,
+        settings: BlobCallisSettings,
+    ) -> Result<(), AureliaError> {
+        if self.recv_stream_exists(stream_id).await {
+            return Ok(());
+        }
+        let Some(pending) = self.take_pending_request(stream_id).await else {
+            warn!(stream_id, "blob stream activation without pending request");
+            return Err(AureliaError::new(ErrorId::BlobStreamNotFound));
+        };
+        let ring = Arc::new(crate::ring_buffer::InboundRingBuffer::new(
+            settings.chunk_size as usize,
+            settings.ack_window_chunks as usize,
+        )?);
+        self.insert_recv_stream(
+            stream_id,
+            pending.taberna_id,
+            Arc::clone(&pending.receiver),
+            ring,
+        )
+        .await;
+        pending.receiver.notify.notify_waiters();
+        info!(
+            taberna_id = pending.taberna_id,
+            stream_id, "blob stream activated"
+        );
+        Ok(())
+    }
+
     pub(super) async fn take_pending_request(
         &self,
         stream_id: PeerMessageId,
     ) -> Option<PendingBlobRequest> {
-        let mut guard = self.pending_requests.lock().await;
-        guard.remove(&stream_id)
+        let mut inbound = self.inbound.lock().await;
+        inbound.pending_requests.remove(&stream_id)
     }
 
     pub(super) async fn drop_pending_request(&self, stream_id: PeerMessageId) {
         let removed = {
-            let mut guard = self.pending_requests.lock().await;
-            guard.remove(&stream_id)
+            let mut inbound = self.inbound.lock().await;
+            inbound.pending_requests.remove(&stream_id)
         };
         if removed.is_some() {
             self.release_inbound(stream_id).await;
@@ -1172,131 +933,307 @@ impl BlobManager {
         receiver: Arc<BlobReceiverState>,
         ring: Arc<crate::ring_buffer::InboundRingBuffer>,
     ) {
-        let mut guard = self.recv_streams.lock().await;
-        guard.insert(
+        let deadline = Instant::now() + receiver.idle_timeout;
+        let mut inbound = self.inbound.lock().await;
+        inbound.recv_streams.insert(
             stream_id,
             BlobRecvStream {
                 taberna_id,
                 receiver,
                 ring,
-                last_activity: Instant::now(),
+                deadline,
             },
         );
+        drop(inbound);
+        self.inbound_idle_notify.notify_one();
+    }
+
+    pub(super) async fn recv_stream_exists(&self, stream_id: PeerMessageId) -> bool {
+        let inbound = self.inbound.lock().await;
+        inbound.recv_streams.contains_key(&stream_id)
+    }
+
+    pub(super) async fn recv_ring(
+        &self,
+        stream_id: PeerMessageId,
+    ) -> Option<Arc<crate::ring_buffer::InboundRingBuffer>> {
+        let inbound = self.inbound.lock().await;
+        inbound
+            .recv_streams
+            .get(&stream_id)
+            .map(|state| Arc::clone(&state.ring))
+    }
+
+    pub(super) async fn recv_chunk_state(
+        &self,
+        stream_id: PeerMessageId,
+        idle_timeout: Duration,
+    ) -> BlobRecvChunkState {
+        let now = Instant::now();
+        let removed = {
+            let mut inbound = self.inbound.lock().await;
+            let Some(state) = inbound.recv_streams.get_mut(&stream_id) else {
+                if let Some(ts) = inbound.completed_recv_streams.get(&stream_id).copied() {
+                    if now.duration_since(ts) <= idle_timeout {
+                        return BlobRecvChunkState::RecentlyCompleted;
+                    }
+                    inbound.completed_recv_streams.remove(&stream_id);
+                }
+                return BlobRecvChunkState::Missing;
+            };
+
+            if now >= state.deadline {
+                let taberna_id = state.taberna_id;
+                let receiver = Arc::clone(&state.receiver);
+                inbound.recv_streams.remove(&stream_id);
+                Some((taberna_id, receiver))
+            } else {
+                return BlobRecvChunkState::Active {
+                    taberna_id: state.taberna_id,
+                    receiver: Arc::clone(&state.receiver),
+                    ring: Arc::clone(&state.ring),
+                    notify: Arc::clone(&state.receiver.notify),
+                };
+            }
+        };
+        let Some((taberna_id, receiver)) = removed else {
+            return BlobRecvChunkState::Missing;
+        };
+        self.release_inbound(stream_id).await;
+        BlobRecvChunkState::IdleTimedOut {
+            taberna_id,
+            receiver,
+        }
+    }
+
+    pub(super) async fn refresh_recv_deadline(
+        &self,
+        stream_id: PeerMessageId,
+        idle_timeout: Duration,
+    ) {
+        let mut inbound = self.inbound.lock().await;
+        if let Some(state) = inbound.recv_streams.get_mut(&stream_id) {
+            state.deadline = Instant::now() + idle_timeout;
+        }
+        drop(inbound);
+        self.inbound_idle_notify.notify_one();
     }
 
     pub(super) async fn remove_recv_stream(
         &self,
         stream_id: PeerMessageId,
     ) -> Option<BlobRecvStream> {
-        let mut guard = self.recv_streams.lock().await;
-        let removed = guard.remove(&stream_id);
-        drop(guard);
+        let removed = {
+            let mut inbound = self.inbound.lock().await;
+            inbound.recv_streams.remove(&stream_id)
+        };
         self.release_inbound(stream_id).await;
         removed
     }
 
+    async fn earliest_recv_deadline(&self) -> Option<Instant> {
+        let inbound = self.inbound.lock().await;
+        inbound
+            .recv_streams
+            .values()
+            .map(|stream| stream.deadline)
+            .min()
+    }
+
+    async fn expire_recv_streams(
+        &self,
+        now: Instant,
+    ) -> Vec<(PeerMessageId, Arc<BlobReceiverState>)> {
+        let expired = {
+            let mut inbound = self.inbound.lock().await;
+            let expired_ids = inbound
+                .recv_streams
+                .iter()
+                .filter_map(|(stream_id, stream)| (stream.deadline <= now).then_some(*stream_id))
+                .collect::<Vec<_>>();
+            expired_ids
+                .into_iter()
+                .filter_map(|stream_id| {
+                    inbound
+                        .recv_streams
+                        .remove(&stream_id)
+                        .map(|stream| (stream_id, stream.receiver))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (stream_id, _) in &expired {
+            self.release_inbound(*stream_id).await;
+        }
+        expired
+    }
+
+    pub(super) async fn run_inbound_idle_reaper(
+        self: Arc<Self>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        loop {
+            let waiter = self.inbound_idle_notify.notified();
+            tokio::pin!(waiter);
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            let Some(deadline) = self.earliest_recv_deadline().await else {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = &mut waiter => {}
+                }
+                continue;
+            };
+            let now = Instant::now();
+            if deadline <= now {
+                let expired = self.expire_recv_streams(now).await;
+                for (stream_id, receiver) in expired {
+                    let err = AureliaError::new(ErrorId::BlobStreamIdleTimeout);
+                    receiver.fail(err.clone()).await;
+                    let payload = ErrorPayload::new(err.kind.as_u32(), err.to_string()).to_bytes();
+                    let _ = self
+                        .enqueue_blob_write(BlobWriteLease::Error {
+                            peer_msg_id: stream_id,
+                            payload: Bytes::from(payload),
+                        })
+                        .await;
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = &mut waiter => {}
+            }
+        }
+    }
+
     pub(super) async fn has_active_streams(&self) -> bool {
-        let pending = self.pending_requests.lock().await;
-        if !pending.is_empty() {
+        let inbound = self.inbound.lock().await;
+        if !inbound.pending_requests.is_empty() || !inbound.recv_streams.is_empty() {
             return true;
         }
-        drop(pending);
-        let recv = self.recv_streams.lock().await;
-        if !recv.is_empty() {
-            return true;
+        drop(inbound);
+        let outbound = self.outbound.lock().await;
+        !outbound.streams.is_empty()
+    }
+
+    pub(super) async fn lifecycle_snapshot(&self) -> BlobLifecycleSnapshot {
+        let has_callis = {
+            let pool = self.callis.lock().await;
+            !pool.order.is_empty()
+        };
+        let inbound_active = {
+            let inbound = self.inbound.lock().await;
+            !inbound.pending_requests.is_empty() || !inbound.recv_streams.is_empty()
+        };
+        let (outbound_active, outbound_work) = {
+            let outbound = self.outbound.lock().await;
+            (
+                !outbound.streams.is_empty(),
+                outbound.response_ready_count() > 0 || !outbound.streams.is_empty(),
+            )
+        };
+        let has_active_streams = inbound_active || outbound_active;
+        BlobLifecycleSnapshot {
+            has_callis,
+            has_active_streams,
+            has_blob_work: has_active_streams || outbound_work,
         }
-        drop(recv);
-        let outbound = self.outbound_streams.lock().await;
-        !outbound.is_empty()
     }
 
     pub(super) async fn fail_all_streams(&self, error: AureliaError) {
-        let mut outbound = self.outbound_streams.lock().await;
-        let rings: Vec<Arc<crate::ring_buffer::OutboundRingBuffer>> =
-            outbound.values().cloned().collect();
-        outbound.clear();
-        drop(outbound);
+        let rings = {
+            let mut outbound = self.outbound.lock().await;
+            let rings: Vec<Arc<crate::ring_buffer::OutboundRingBuffer>> =
+                outbound.streams.values().cloned().collect();
+            outbound.streams.clear();
+            outbound.inflight.clear();
+            outbound.write_slots.clear();
+            outbound.ack_ready.clear();
+            outbound.error_ready.clear();
+            outbound.complete_ready.clear();
+            outbound.stream_settings.clear();
+            rings
+        };
         for ring in rings {
             ring.fail(error.clone()).await;
             ring.close().await;
         }
 
-        let mut outbound_reservations = self.outbound_reservations.lock().await;
-        for bytes in outbound_reservations.values() {
-            self.buffer_tracker.release_outbound(*bytes);
+        let reservations = {
+            let mut reservations = self.reservations.lock().await;
+            let outbound = reservations
+                .outbound
+                .drain()
+                .map(|(_, bytes)| bytes)
+                .collect::<Vec<_>>();
+            let inbound = reservations
+                .inbound
+                .drain()
+                .map(|(_, bytes)| bytes)
+                .collect::<Vec<_>>();
+            (outbound, inbound)
+        };
+        for bytes in reservations.0 {
+            self.buffer_tracker.release_outbound(bytes);
         }
-        outbound_reservations.clear();
-        drop(outbound_reservations);
-
-        let mut inbound_reservations = self.inbound_reservations.lock().await;
-        for bytes in inbound_reservations.values() {
-            self.buffer_tracker.release_inbound(*bytes);
+        for bytes in reservations.1 {
+            self.buffer_tracker.release_inbound(bytes);
         }
-        inbound_reservations.clear();
-        drop(inbound_reservations);
 
-        let mut inflight = self.inflight_map.lock().await;
-        inflight.clear();
-        drop(inflight);
-        let mut inflight_chunks = self.inflight_chunks.lock().await;
-        inflight_chunks.clear();
-        drop(inflight_chunks);
-
-        let mut retained = self.retained.lock().await;
-        retained.clear();
-        drop(retained);
-
-        let mut stream_callis = self.stream_callis.lock().await;
-        stream_callis.clear();
-        drop(stream_callis);
-
-        let mut callis_streams = self.callis_streams.lock().await;
-        callis_streams.clear();
-        drop(callis_streams);
-
-        let mut stream_settings = self.stream_settings.lock().await;
-        stream_settings.clear();
-        drop(stream_settings);
-
-        let mut unassigned = self.unassigned_streams.lock().await;
-        unassigned.clear();
-        drop(unassigned);
-
-        let mut completed = self.completed_streams.lock().await;
-        completed.clear();
-        drop(completed);
-        let mut completed_recv = self.completed_recv_streams.lock().await;
-        completed_recv.clear();
-        drop(completed_recv);
-
-        let mut pending_replay = self.pending_replay.lock().await;
-        pending_replay.clear();
-        drop(pending_replay);
-
-        let mut pending = self.pending_requests.lock().await;
-        pending.clear();
-        drop(pending);
-
-        let mut recv = self.recv_streams.lock().await;
-        let streams: Vec<(PeerMessageId, BlobRecvStream)> = recv.drain().collect();
-        drop(recv);
+        let streams = {
+            let mut inbound = self.inbound.lock().await;
+            inbound.pending_requests.clear();
+            inbound.completed_recv_streams.clear();
+            inbound.recv_streams.drain().collect::<Vec<_>>()
+        };
         for (_stream_id, stream) in streams {
-            {
-                let mut guard = stream.receiver.error.lock().await;
-                *guard = Some(error.clone());
-            }
-            stream.receiver.completed.store(true, Ordering::SeqCst);
-            stream.receiver.notify.notify_waiters();
+            stream.receiver.fail(error.clone()).await;
         }
     }
 }
 
-pub(super) mod dispatch;
+fn order_streams_from_cursor(
+    streams: &mut [(PeerMessageId, Arc<crate::ring_buffer::OutboundRingBuffer>)],
+    cursor: Option<PeerMessageId>,
+) {
+    streams.sort_unstable_by_key(|(stream_id, _)| *stream_id);
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let split = streams
+        .iter()
+        .position(|(stream_id, _)| *stream_id >= cursor)
+        .unwrap_or(0);
+    streams.rotate_left(split);
+}
+
+fn next_stream_after(
+    streams: &HashMap<PeerMessageId, Arc<crate::ring_buffer::OutboundRingBuffer>>,
+    stream_id: PeerMessageId,
+) -> Option<PeerMessageId> {
+    let mut ids = streams.keys().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    if ids.is_empty() {
+        return None;
+    }
+    ids.iter()
+        .copied()
+        .find(|candidate| *candidate > stream_id)
+        .or_else(|| ids.first().copied())
+}
+
 pub(super) mod io;
 pub(super) mod receive;
 
-pub(super) use dispatch::{dispatch_blob, send_blob_control_and_wait_ack};
 pub(crate) use receive::blob_buffer_full_error;
-pub(super) use receive::{
-    handle_blob_request, handle_blob_transfer_chunk, handle_blob_transfer_start,
-};
+pub(super) use receive::{handle_blob_request, handle_blob_transfer_chunk};

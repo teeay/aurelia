@@ -13,35 +13,64 @@ use tracing::warn;
 use crate::config::DomusConfigAccess;
 use crate::send::{SendOptions, SendOutcome};
 use crate::taberna::TabernaInbox;
-use crate::transport::{blob_buffer_full_error, BlobBufferTracker};
+use crate::transport::{blob_buffer_full_error, BlobBufferReservationFailure, BlobBufferTracker};
 use crate::{BlobReceiver, BlobSender};
 use aurelia_ids::{AureliaError, ErrorId, MessageType, TabernaId};
 
-struct LocalBlobSender {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobBufferDirection {
+    Outbound,
+    Inbound,
+}
+
+struct TrackedDuplex {
     inner: tokio::io::DuplexStream,
     tracker: Arc<BlobBufferTracker>,
     bytes: u64,
+    direction: BlobBufferDirection,
 }
 
-impl LocalBlobSender {
-    fn new(inner: tokio::io::DuplexStream, tracker: Arc<BlobBufferTracker>, bytes: u64) -> Self {
+impl TrackedDuplex {
+    fn outbound(
+        inner: tokio::io::DuplexStream,
+        tracker: Arc<BlobBufferTracker>,
+        bytes: u64,
+    ) -> Self {
         Self {
             inner,
             tracker,
             bytes,
+            direction: BlobBufferDirection::Outbound,
+        }
+    }
+
+    fn inbound(
+        inner: tokio::io::DuplexStream,
+        tracker: Arc<BlobBufferTracker>,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            tracker,
+            bytes,
+            direction: BlobBufferDirection::Inbound,
         }
     }
 }
 
-impl Drop for LocalBlobSender {
+impl Drop for TrackedDuplex {
     fn drop(&mut self) {
-        if self.bytes > 0 {
-            self.tracker.release_outbound(self.bytes);
+        if self.bytes == 0 {
+            return;
+        }
+        match self.direction {
+            BlobBufferDirection::Outbound => self.tracker.release_outbound(self.bytes),
+            BlobBufferDirection::Inbound => self.tracker.release_inbound(self.bytes),
         }
     }
 }
 
-impl AsyncWrite for LocalBlobSender {
+impl AsyncWrite for TrackedDuplex {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -59,31 +88,7 @@ impl AsyncWrite for LocalBlobSender {
     }
 }
 
-struct LocalBlobReceiver {
-    inner: tokio::io::DuplexStream,
-    tracker: Arc<BlobBufferTracker>,
-    bytes: u64,
-}
-
-impl LocalBlobReceiver {
-    fn new(inner: tokio::io::DuplexStream, tracker: Arc<BlobBufferTracker>, bytes: u64) -> Self {
-        Self {
-            inner,
-            tracker,
-            bytes,
-        }
-    }
-}
-
-impl Drop for LocalBlobReceiver {
-    fn drop(&mut self) {
-        if self.bytes > 0 {
-            self.tracker.release_inbound(self.bytes);
-        }
-    }
-}
-
-impl AsyncRead for LocalBlobReceiver {
+impl AsyncRead for TrackedDuplex {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -124,32 +129,35 @@ pub(crate) async fn deliver_local(
     }
 
     let cfg = config.snapshot().await;
-    if cfg.blob_chunk_size == 0 || cfg.blob_ack_window == 0 {
+    if cfg.blob_window.chunk_size() == 0 || cfg.blob_window.ack_window() == 0 {
         return Err(AureliaError::new(ErrorId::ProtocolViolation));
     }
-    let reservation_bytes = (cfg.blob_chunk_size as u64).saturating_mul(cfg.blob_ack_window as u64);
-    if !blob_buffers.try_reserve_outbound(reservation_bytes, cfg.blob_outbound_buffer_bytes) {
-        return Err(blob_buffer_full_error(
-            "outbound",
+    let reservation_bytes =
+        (cfg.blob_window.chunk_size() as u64).saturating_mul(cfg.blob_window.ack_window() as u64);
+    blob_buffers
+        .try_reserve_pair(
+            reservation_bytes,
             cfg.blob_outbound_buffer_bytes,
-        ));
-    }
-    if !blob_buffers.try_reserve_inbound(reservation_bytes, cfg.blob_inbound_buffer_bytes) {
-        blob_buffers.release_outbound(reservation_bytes);
-        return Err(blob_buffer_full_error(
-            "inbound",
+            reservation_bytes,
             cfg.blob_inbound_buffer_bytes,
-        ));
-    }
+        )
+        .map_err(|failure| match failure {
+            BlobBufferReservationFailure::Outbound => {
+                blob_buffer_full_error("outbound", cfg.blob_outbound_buffer_bytes)
+            }
+            BlobBufferReservationFailure::Inbound => {
+                blob_buffer_full_error("inbound", cfg.blob_inbound_buffer_bytes)
+            }
+        })?;
     let capacity = reservation_bytes.min(usize::MAX as u64) as usize;
     let capacity = capacity.max(1);
     let (sender_stream, receiver_stream) = tokio::io::duplex(capacity);
-    let sender = BlobSender::new(Box::new(LocalBlobSender::new(
+    let sender = BlobSender::new(Box::new(TrackedDuplex::outbound(
         sender_stream,
         Arc::clone(&blob_buffers),
         reservation_bytes,
     )));
-    let receiver = BlobReceiver::new(Box::new(LocalBlobReceiver::new(
+    let receiver = BlobReceiver::new(Box::new(TrackedDuplex::inbound(
         receiver_stream,
         Arc::clone(&blob_buffers),
         reservation_bytes,

@@ -1,9 +1,10 @@
 # Containers Layout
 
-- `containers/_shared/`: base images and shared container assets for tests.
+- `containers/shared/`: base images and shared container assets for tests.
 - `containers/<suite>/`: suite-specific Dockerfiles and Compose files (for example `containers/peering/`).
 
-Use `containers/_shared/Dockerfile.test-base` as the base for test app images.
+Use the builder and runtime base images under `containers/shared/` as the bases for test app
+images.
 
 <!--
 This file is part of the Aurelia workspace.

@@ -43,16 +43,23 @@ Status: Developed
 All scenario steps that drive the peer apps (set behaviors, crash, shutdown, reload-auth) travel
 on the Out-of-Band (OOB) Test Control Plane defined below. No scenario uses the A1 transport for
 test control. Network failure injection (`tc/netem`) is performed locally on the driver
-container; the peer's `NET_ADMIN` capability is no longer used by tests.
+container; peer containers do not require `NET_ADMIN`.
 
 | Scenario | Purpose | Real-World Replacement | Notes |
 | --- | --- | --- | --- |
 | `scenario_listener_originator` | Validate basic send/receive. | None. | Normal path. |
+| `scenario_concurrent_primary_sends` | Validate concurrent primary sends across one peer and multiple peers. | Multiple application requests in flight at once. | Uses short local operation deadlines and an E2E app accept queue sized for transport concurrency. |
+| `scenario_concurrent_blob_streams` | Validate concurrent blob transfers on one peer relationship. | Multiple large payload streams in flight over the blob callis. | Asserts every stream completes and returns the expected byte count. |
+| `scenario_primary_while_blobs_active` | Validate primary traffic is not starved by blob streams. | Normal control message while large payload streams are active. | Primary ping must complete while blob work is open. |
 | `scenario_reconnect_replay` | Replay after temporary disconnect. | Apply temporary NetEm partition on the driver and let it auto-clear. | Partition window must be shorter than `send_timeout` when replay is expected. |
+| `scenario_blob_reconnect_replay` | Blob replay after temporary disconnect. | Apply temporary NetEm partition on the driver during an active blob transfer. | Stream must complete after unacknowledged chunk replay. |
 | `scenario_peer_restart` | Restart recovery. | OOB `crash` then Docker restarts the container. | Driver pings before, awaits `ready` on OOB, pings after. Verifies clean recovery without relying on aurelia internals (e.g., fresh-session error codes on inflight). |
 | `scenario_smooth_rotation` | Reload auth material without disruption. | Reload during in-flight traffic. | Existing callis continues; sends across the reload all succeed. A subsequent fresh dial uses the new cert. |
-| `scenario_graceful_close` | Graceful shutdown plus restart. | OOB `shutdown <ms>` command. | Use driver domus; expect `PeerUnavailable` during downtime. After downtime probes, the driver awaits `ready` on OOB. |
-| `scenario_backpressure` | Send queue / inflight pressure. | None. | Uses short timeouts. |
+| `scenario_graceful_close` | Graceful shutdown plus restart. | OOB `shutdown <ms>` command. | Use driver domus; queued work fails promptly, probes observe downtime, then the driver awaits `ready` on OOB. |
+| `scenario_backpressure` | A3 admission and inflight pressure. | None. | A3 saturation fails immediately with `LocalQueueFull`; inflight pressure remains bounded by original deadlines. |
+| `scenario_actix_taberna` | Actix-backed taberna bridge behavior. | Optional application adapter over public Taberna API. | Uses OOB control to park the Actix actor for mailbox-full admission and to stop the recipient for `taberna-shutdown`; measured traffic still travels only on A1. |
+| `scenario_reliability_deadlines` | Queued and inflight original-deadline expiry. | Slow or unavailable peer while sends are accepted locally. | Verifies queued and inflight sends fail by their original deadline while accepted work remains transport-owned. |
+| `scenario_dropped_waiter_retained_completion` | Dropped sender wait interest leaves accepted outbound work retained. | Application cancels its local wait future after submit. | Verifies the remote peer may still receive/ACK the message and transport state resolves cleanly. |
 | `scenario_taberna_errors` | Taberna rejection paths. | None. | Unchanged. |
 | `scenario_receive_timeout` | Taberna receive timeout plus shutdown mapping. | None. | Local driver domus taberna `next` uses short timeout, then expects `domus-closed` after shutdown. |
 | `scenario_unknown_taberna` | Unknown taberna handling. | None. | Unchanged. |
@@ -76,6 +83,9 @@ The two failure modes are tested as deliberately distinct scenarios:
 
 - Driver issues `oob_control(domus, "shutdown <downtime-ms>")`.
 - Driver sets `send_timeout` and `accept_timeout` to `<= 1000ms` for fast probe failure.
+- If the app task already holds a blocked request when shutdown starts, dropping that
+  `TabernaRequest` may report `RemoteTabernaRejected`; this is an acceptable prompt close result
+  for the queued-work probe because the sender did not wait for a long transport timeout.
 - During the downtime window, the driver fires fresh probe domus dials at the peer; each is
   expected to fail with `PeerUnavailable`, `SendTimeout`, or `ConnectionLost` (any indicates the
   listener is closed). At least one such failure within the probe window proves the peer is in
@@ -94,6 +104,65 @@ the process exits at the end of the window.
 
 - All scenarios define explicit time bounds; no unbounded waits.
 - Suites use the runner timeout harness to prevent hangs.
+- Scenario operation timeouts must be shorter than production defaults when the path is expected
+  to complete quickly on local Docker networking.
+- The E2E suite timeout is an outer guard for Docker startup and catastrophic hangs; individual
+  send, receive, callback, shutdown, reconnect, and readiness expectations must have their own
+  tighter deadlines.
+- Failure scenarios must configure short local `send_timeout`, accept timeout, callback timeout,
+  keepalive interval, or reconnect windows so close-timeout and missed-wakeup bugs are observed
+  directly rather than after a long default timeout.
+
+### Concurrent Coverage
+
+Peering E2E coverage includes only scenarios that exercise behavior unit or integration tests
+cannot fully prove with mocked dependencies:
+
+- **Concurrent primary sends:** multiple driver tasks send A3 messages to one peer and to multiple
+  peers concurrently. All replies must arrive within a short local operation deadline and progress
+  must not depend on keepalive ticks.
+- **Concurrent blob streams:** multiple blob transfers run concurrently over the same peer
+  relationship. Each stream must complete with the expected byte count and no starvation of other
+  streams.
+- **Primary traffic while blobs are active:** normal primary messages complete while blob streams
+  are open and dispatching chunks.
+- **Reconnect during active primary work:** a short driver-side NetEm partition interrupts active
+  primary sends. The partition window is shorter than the configured send timeout, and replay
+  completes promptly after connectivity returns. Replay must preserve the message's original
+  deadline and must not grant a fresh send budget.
+- **Queued and inflight original-deadline expiry:** a scenario must arrange one message to remain
+  queued without dispatcher progress and one message to become inflight without receiving ACK. Both
+  must fail close to their configured `send_timeout` even if the application is not relying on a
+  caller-side timeout future as the only reaper.
+- **A3 admission overrun:** a scenario must saturate the A3 retained lane and verify the next A3
+  send fails immediately with `LocalQueueFull`, without waiting for `send_timeout` and without
+  hidden sender-side buffering. The same scenario must observe the outbound queue overrun reporting
+  signal.
+- **Actix taberna bridge:** a scenario must send through an Actix-backed taberna registered by the
+  peer application through the public `aurelia` API. The mailbox-full branch parks the first Actix
+  handler invocation through OOB control, uses mailbox capacity `1`, and expects a later send to
+  observe `TabernaBusy`. The recipient-shutdown branch keeps the Aurelia bridge handle alive,
+  stops the Actix recipient through OOB control, waits for the OOB stopped acknowledgement, and
+  expects the measured A1 send to observe `TabernaShutdown`.
+- **Dropped waiter retained completion:** a scenario must cancel/drop the local send wait interest
+  after A1 accepts the outbound work. The retained store keeps transport work live until ACK,
+  timeout, close, or failure completion. Completion is best-effort if the caller is gone.
+- **Reconnect during active blob work:** a short driver-side NetEm partition interrupts active blob
+  streaming. Unacknowledged chunks replay and the stream completes without duplicate delivery.
+- **Graceful close while work is queued:** queued primary work is started before OOB graceful
+  shutdown, and the queued non-A1 work fails with the expected close, peer-unavailable, timeout,
+  connection-lost, or dropped-request rejection result within a short configured deadline.
+- **Auth reload during live traffic:** smooth auth reload runs while primary traffic is in flight.
+  Existing callis continue, and subsequent traffic succeeds after reload.
+
+Scenario design constraints:
+
+- Control remains on the OOB plane only.
+- NetEm failure injection remains driver-side unless a specific scenario documents why peer-side
+  injection is required.
+- Each scenario must use event-based readiness and completion observations where available.
+- Scenario-local timeouts must be configured explicitly and justified by the expected local Docker
+  path, while the suite harness remains the final outer bound.
 
 ### Out-of-Band (OOB) Test Control Plane
 
@@ -141,7 +210,17 @@ Line-based, UTF-8.
 - `set app <behavior> [duration_ms]` — `Normal | Block | Reject | IngressFull | Busy | DecodeFailure`.
   Optional `duration_ms` schedules a peer-side restoration of `Normal` after the behavior
   duration. This is a behavior duration, not a synchronisation delay.
+- `wait app blocked <timeout_ms>` — returns `OK` after a normal taberna handler enters the current
+  app `Block` generation. Returns `ERR` if app behavior is not currently `Block` or the timeout
+  expires before any handler enters the blocking path.
+- `arm app blob-started` — arms the next blob-start observation for the app taberna.
+- `wait app blob-started <timeout_ms>` — returns `OK` after a blob receiver is handed to the app
+  handler for the armed blob-start generation. Returns `ERR` if no blob-start wait is armed or the
+  timeout expires.
 - `unblock app` — equivalent to `set app normal`.
+- `wait actix blocked <timeout_ms>` — returns `OK` after the Actix recipient handler enters the
+  current Actix `Block` generation. Returns `ERR` if Actix behavior is not currently `Block` or the
+  timeout expires before the handler enters the blocking path.
 - `shutdown <ms>` — graceful shutdown of A1, then `process::exit(2)` after the `<ms>` downtime
   window. The OOB listener also stops at the start of the shutdown sequence.
 - `crash` — exit, with event-based delivery synchronisation. Sequence:

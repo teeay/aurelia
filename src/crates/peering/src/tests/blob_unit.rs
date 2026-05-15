@@ -4,9 +4,17 @@
 
 use bytes::Bytes;
 
-use crate::wire::{
-    BlobChunkFlags, BlobTransferChunkPayload, BlobTransferStartPayload, HelloPayload, WireFlags,
-};
+fn encode_blob_chunk_payload(payload: &BlobTransferChunkPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BlobTransferChunkPayload::HEADER_LEN + payload.chunk.len());
+    out.extend_from_slice(&payload.request_msg_id.to_be_bytes());
+    out.extend_from_slice(&payload.chunk_id.to_be_bytes());
+    out.extend_from_slice(&payload.flags.bits().to_be_bytes());
+    out.extend_from_slice(&(payload.chunk.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload.chunk);
+    out
+}
+
+use crate::wire::{BlobChunkFlags, BlobTransferChunkPayload, HelloPayload, WireFlags};
 use aurelia_ids::ErrorId;
 
 #[test]
@@ -17,10 +25,7 @@ fn wire_flags_values_are_stable() {
 
 #[test]
 fn hello_payload_roundtrip_primary() {
-    let payload = HelloPayload {
-        chunk_size: None,
-        ack_window_chunks: None,
-    };
+    let payload = HelloPayload::Primary;
     let bytes = payload.to_bytes();
     assert!(bytes.is_empty());
     let decoded = HelloPayload::from_bytes(&bytes).expect("decode primary");
@@ -29,9 +34,9 @@ fn hello_payload_roundtrip_primary() {
 
 #[test]
 fn hello_payload_roundtrip_blob() {
-    let payload = HelloPayload {
-        chunk_size: Some(1200),
-        ack_window_chunks: Some(64),
+    let payload = HelloPayload::Blob {
+        chunk_size: 1200,
+        ack_window_chunks: 64,
     };
     let bytes = payload.to_bytes();
     assert_eq!(bytes.len(), HelloPayload::BLOB_LEN);
@@ -46,20 +51,6 @@ fn hello_payload_rejects_invalid_length() {
 }
 
 #[test]
-fn blob_transfer_start_roundtrip() {
-    let payload = BlobTransferStartPayload { request_msg_id: 42 };
-    let bytes = payload.to_bytes();
-    let decoded = BlobTransferStartPayload::from_bytes(&bytes).expect("decode start");
-    assert_eq!(decoded, payload);
-}
-
-#[test]
-fn blob_transfer_start_rejects_invalid_length() {
-    let bytes = [0u8; 3];
-    assert!(BlobTransferStartPayload::from_bytes(&bytes).is_err());
-}
-
-#[test]
 fn blob_transfer_chunk_roundtrip() {
     let payload = BlobTransferChunkPayload {
         request_msg_id: 7,
@@ -67,7 +58,7 @@ fn blob_transfer_chunk_roundtrip() {
         flags: BlobChunkFlags::LAST_CHUNK,
         chunk: Bytes::from_static(b"abc"),
     };
-    let bytes = payload.to_bytes();
+    let bytes = encode_blob_chunk_payload(&payload);
     let decoded = BlobTransferChunkPayload::from_bytes(&bytes).expect("decode chunk");
     assert_eq!(decoded, payload);
 }
@@ -80,7 +71,7 @@ fn blob_transfer_chunk_rejects_invalid_length() {
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"abc"),
     };
-    let mut bytes = payload.to_bytes();
+    let mut bytes = encode_blob_chunk_payload(&payload);
     bytes.pop();
     assert!(BlobTransferChunkPayload::from_bytes(&bytes).is_err());
 }
@@ -93,7 +84,7 @@ fn blob_transfer_chunk_rejects_unknown_flags() {
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"abc"),
     };
-    let mut bytes = payload.to_bytes();
+    let mut bytes = encode_blob_chunk_payload(&payload);
     bytes[12] = 0x80;
     bytes[13] = 0x00;
     let err = BlobTransferChunkPayload::from_bytes(&bytes).expect_err("expected invalid flags");

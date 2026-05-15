@@ -25,6 +25,20 @@ sanitize_image_tag() {
 }
 
 image_tag=$(sanitize_image_tag "$project_suffix")
+image_version="local"
+builder_base_image="aurelia-${image_tag}-builder-base:${image_version}"
+runtime_base_image="aurelia-${image_tag}-runtime-base:${image_version}"
+
+build_shared_images() {
+  docker build \
+    -t "$builder_base_image" \
+    -f "$root_dir/containers/shared/Dockerfile.builder-base" \
+    "$root_dir/containers/shared"
+  docker build \
+    -t "$runtime_base_image" \
+    -f "$root_dir/containers/shared/Dockerfile.runtime-base" \
+    "$root_dir/containers/shared"
+}
 
 hash_hex() {
   local input="$1"
@@ -166,6 +180,7 @@ while [[ $attempt -lt $max_attempts ]]; do
 
   export COMPOSE_PROJECT_NAME="$project_name"
   export AURELIA_E2E_IMAGE_TAG="$image_tag"
+  export AURELIA_E2E_IMAGE_VERSION="$image_version"
   export AURELIA_E2E_SUBNET="$subnet"
   export AURELIA_E2E_DOMUS_1_IP="$domus_1_ip"
   export AURELIA_E2E_DOMUS_2_IP="$domus_2_ip"
@@ -174,6 +189,8 @@ while [[ $attempt -lt $max_attempts ]]; do
 
   echo "Using compose project: $project_name"
   echo "Using subnet: $subnet"
+
+  build_shared_images
 
   "$root_dir/scripts/testing/generate-certs.sh" --out "$certs_dir" --force \
     "domus-1=${domus_1_ip}:5000" \

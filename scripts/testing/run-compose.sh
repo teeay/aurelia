@@ -21,6 +21,17 @@ if [[ -z "$compose_file" || "$compose_file" == "--help" || "$compose_file" == "-
   exit 1
 fi
 
+stack_started=0
+cleanup_done=0
+cleanup_stack() {
+  if [[ "$stack_started" -eq 1 && "$cleanup_done" -eq 0 ]]; then
+    cleanup_done=1
+    docker compose -f "$compose_file" down -v || true
+  fi
+}
+trap cleanup_stack EXIT
+trap 'cleanup_stack; exit 130' INT TERM
+
 build_flag=""
 exit_code_from=""
 while [[ $# -gt 0 ]]; do
@@ -48,12 +59,13 @@ done
 
 if [[ -n "$exit_code_from" ]]; then
   set +e
+  stack_started=1
   docker compose -f "$compose_file" up $build_flag -d
   status=$?
   set -e
 
   if [[ $status -ne 0 ]]; then
-    docker compose -f "$compose_file" down -v
+    cleanup_stack
     exit $status
   fi
 
@@ -68,14 +80,14 @@ if [[ -n "$exit_code_from" ]]; then
 
   if [[ -z "$service_id" ]]; then
     echo "Unable to locate container for service: $exit_code_from" >&2
-    docker compose -f "$compose_file" down -v
+    cleanup_stack
     exit 1
   fi
 
   timeout_bin=$(command -v timeout || true)
   if [[ -z "$timeout_bin" ]]; then
     echo "timeout command not found; install coreutils to enforce suite timeouts" >&2
-    docker compose -f "$compose_file" down -v
+    cleanup_stack
     exit 1
   fi
   suite_timeout_secs="${AURELIA_E2E_TIMEOUT_SECS:-600}"
@@ -128,7 +140,7 @@ if [[ -n "$exit_code_from" ]]; then
     status=1
   fi
 
-  docker compose -f "$compose_file" down -v
+  cleanup_stack
   exit "$status"
 fi
 
@@ -139,9 +151,10 @@ if [[ -z "$timeout_bin" ]]; then
   exit 1
 fi
 suite_timeout_secs="${AURELIA_E2E_TIMEOUT_SECS:-600}"
+stack_started=1
 "$timeout_bin" "${suite_timeout_secs}s" docker compose -f "$compose_file" up $build_flag --abort-on-container-exit
 status=$?
 set -e
 
-docker compose -f "$compose_file" down -v
+cleanup_stack
 exit $status

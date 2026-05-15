@@ -2,205 +2,98 @@
 // SPDX-FileCopyrightText: 2026 Zivatar Limited
 // SPDX-License-Identifier: Apache-2.0
 
-use actix::prelude::Recipient;
-use bytes::Bytes;
-use std::sync::Arc;
-use tokio::sync::{oneshot, Notify};
+use actix::prelude::{Recipient, SendError};
 
-#[cfg(test)]
-use crate::codec::decode_error;
 use crate::codec::MessageCodec;
-use crate::taberna::TabernaInbox;
+use crate::taberna::Taberna;
 use crate::BlobReceiver;
-use aurelia_ids::{AureliaError, ErrorId};
+use aurelia_ids::ErrorId;
 
-pub struct ActixTabernaSink<C>
+/// Typed Actix delivery envelope for a taberna request.
+///
+/// The envelope preserves both the decoded application message and any blob receiver carried by
+/// the inbound request. Actix mailbox admission is the Aurelia acceptance boundary, so handlers
+/// return `()` and application-level failures must travel in application messages.
+pub struct ActixTabernaDelivery<M>
 where
-    C: MessageCodec,
-    C::AppMessage: actix::Message + Send + 'static,
-    <C::AppMessage as actix::Message>::Result: Send,
+    M: Send + 'static,
 {
-    codec: C,
-    recipient: Recipient<C::AppMessage>,
-    runtime_handle: tokio::runtime::Handle,
+    /// Decoded application message produced by the configured [`MessageCodec`].
+    pub message: M,
+    /// Optional blob receiver attached to the inbound request.
+    pub blob_receiver: Option<BlobReceiver>,
 }
 
-impl<C> ActixTabernaSink<C>
+impl<M> actix::Message for ActixTabernaDelivery<M>
 where
-    C: MessageCodec,
-    C::AppMessage: actix::Message + Send + 'static,
-    <C::AppMessage as actix::Message>::Result: Send,
+    M: Send + 'static,
 {
-    pub fn new(
-        codec: C,
-        recipient: Recipient<C::AppMessage>,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            codec,
-            recipient,
-            runtime_handle,
-        }
+    type Result = ();
+}
+
+/// Registration handle for an Actix-backed taberna bridge.
+///
+/// Dropping the handle aborts the Actix-side bridge task, which drops the underlying
+/// [`Taberna`] and schedules deregistration from its parent domus.
+pub struct ActixTaberna {
+    bridge: tokio::task::JoinHandle<()>,
+}
+
+impl ActixTaberna {
+    pub(crate) fn new<Codec>(
+        taberna: Taberna<Codec>,
+        recipient: Recipient<ActixTabernaDelivery<Codec::AppMessage>>,
+    ) -> Self
+    where
+        Codec: MessageCodec + 'static,
+        Codec::AppMessage: Send + Sync + 'static,
+    {
+        let bridge = actix::spawn(run_bridge(taberna, recipient));
+        Self { bridge }
     }
 }
 
-#[async_trait::async_trait]
-impl<C> TabernaInbox for ActixTabernaSink<C>
-where
-    C: MessageCodec,
-    C::AppMessage: actix::Message + Send + 'static,
-    <C::AppMessage as actix::Message>::Result: Send,
+impl Drop for ActixTaberna {
+    fn drop(&mut self) {
+        self.bridge.abort();
+    }
+}
+
+async fn run_bridge<Codec>(
+    taberna: Taberna<Codec>,
+    recipient: Recipient<ActixTabernaDelivery<Codec::AppMessage>>,
+) where
+    Codec: MessageCodec + 'static,
+    Codec::AppMessage: Send + Sync + 'static,
 {
-    async fn enqueue(
-        &self,
-        msg_type: u32,
-        payload: Bytes,
-        _blob_receiver: Option<BlobReceiver>,
-        notify: Option<Arc<Notify>>,
-    ) -> Result<oneshot::Receiver<Result<(), AureliaError>>, AureliaError> {
-        let message = self
-            .codec
-            .decode_app(msg_type, &payload)
-            .map_err(|err| AureliaError::with_message(ErrorId::DecodeFailure, err.to_string()))?;
-        let recipient = self.recipient.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        let (tx, rx) = oneshot::channel();
-        runtime_handle.spawn(async move {
-            let result = recipient
-                .send(message)
-                .await
-                .map(|_| ())
-                .map_err(|_| AureliaError::new(ErrorId::RemoteTabernaRejected));
-            let _ = tx.send(result);
-            if let Some(notify) = notify.as_ref() {
-                notify.notify_one();
+    loop {
+        let request = match taberna.next(None).await {
+            Ok(request) => request,
+            Err(err) if err.kind == ErrorId::ReceiveTimeout => continue,
+            Err(_) => break,
+        };
+
+        let parts = request.into_parts();
+        let delivery = ActixTabernaDelivery {
+            message: parts.message,
+            blob_receiver: parts.blob_receiver,
+        };
+
+        match recipient.try_send(delivery) {
+            Ok(()) => {
+                parts.completion.accept();
             }
-        });
-        Ok(rx)
+            Err(SendError::Full(_delivery)) => {
+                parts.completion.busy();
+            }
+            Err(SendError::Closed(_delivery)) => {
+                parts.completion.taberna_shutdown();
+                break;
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use actix::{Actor, ActorContext, Context, Handler};
-
-    use super::*;
-    use crate::EncodedMessage;
-
-    #[derive(actix::Message)]
-    #[rtype(result = "()")]
-    struct TestMessage(String);
-
-    #[derive(Clone, Copy)]
-    struct TestCodec;
-
-    impl MessageCodec for TestCodec {
-        type AppMessage = TestMessage;
-
-        fn encode_app(&self, msg: &Self::AppMessage) -> Result<EncodedMessage, AureliaError> {
-            Ok(EncodedMessage::new(7, Bytes::from(msg.0.clone())))
-        }
-
-        fn decode_app(
-            &self,
-            msg_type: u32,
-            payload: &[u8],
-        ) -> Result<Self::AppMessage, AureliaError> {
-            if msg_type != 7 {
-                return Err(decode_error("unexpected msg_type"));
-            }
-            let payload =
-                String::from_utf8(payload.to_vec()).map_err(|err| decode_error(err.to_string()))?;
-            Ok(TestMessage(payload))
-        }
-    }
-
-    struct RecordingActor {
-        received: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Actor for RecordingActor {
-        type Context = Context<Self>;
-    }
-
-    impl Handler<TestMessage> for RecordingActor {
-        type Result = ();
-
-        fn handle(&mut self, msg: TestMessage, _ctx: &mut Self::Context) -> Self::Result {
-            self.received.lock().expect("received lock").push(msg.0);
-        }
-    }
-
-    struct StopActor;
-
-    impl Actor for StopActor {
-        type Context = Context<Self>;
-    }
-
-    impl Handler<TestMessage> for StopActor {
-        type Result = ();
-
-        fn handle(&mut self, _msg: TestMessage, ctx: &mut Self::Context) -> Self::Result {
-            ctx.stop();
-        }
-    }
-
-    #[actix::test]
-    async fn actix_taberna_sink_delivers_decoded_message() {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let recipient = RecordingActor {
-            received: Arc::clone(&received),
-        }
-        .start()
-        .recipient();
-        let sink = ActixTabernaSink::new(TestCodec, recipient, tokio::runtime::Handle::current());
-
-        let rx = sink
-            .enqueue(7, Bytes::from_static(b"hello"), None, None)
-            .await
-            .expect("actix enqueue");
-        rx.await.expect("accept recv").expect("actix accept");
-
-        let received = received.lock().expect("received lock");
-        assert_eq!(received.as_slice(), ["hello"]);
-    }
-
-    #[actix::test]
-    async fn actix_taberna_sink_maps_decode_failures() {
-        let recipient = RecordingActor {
-            received: Arc::new(Mutex::new(Vec::new())),
-        }
-        .start()
-        .recipient();
-        let sink = ActixTabernaSink::new(TestCodec, recipient, tokio::runtime::Handle::current());
-
-        let err = sink
-            .enqueue(90, Bytes::from_static(b"bad"), None, None)
-            .await
-            .expect_err("expected decode failure");
-        assert_eq!(err.kind, ErrorId::DecodeFailure);
-        let message = err.message.expect("decode message");
-        assert!(message.contains("unexpected msg_type"));
-    }
-
-    #[actix::test]
-    async fn actix_taberna_sink_maps_mailbox_failures() {
-        let addr = StopActor.start();
-        addr.do_send(TestMessage("stop".into()));
-        let recipient = addr.recipient();
-        actix::clock::sleep(std::time::Duration::from_millis(20)).await;
-        let sink = ActixTabernaSink::new(TestCodec, recipient, tokio::runtime::Handle::current());
-
-        let rx = sink
-            .enqueue(7, Bytes::from_static(b"after-stop"), None, None)
-            .await
-            .expect("enqueue");
-        let err = rx
-            .await
-            .expect("accept recv")
-            .expect_err("expected mailbox failure");
-        assert_eq!(err.kind, ErrorId::RemoteTabernaRejected);
-    }
-}
+#[path = "tests/actix_adapter.rs"]
+mod tests;

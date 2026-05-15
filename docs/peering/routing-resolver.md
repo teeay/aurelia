@@ -12,7 +12,10 @@ Status: Developed
 
 ### Resolver Boundary
 
-The transport depends on A2/A3 layers for taberna reachability. A resolver provides the mapping.
+The transport depends on a resolver for taberna reachability. `aurelia-peering`
+consumes the `RouteResolver` trait, `DomusAddr`, and `TransportKind` from the shared
+`aurelia-data` crate. Resolver implementations depend on that shared contract, not on the peering
+transport implementation.
 
 ```rust
 #[async_trait::async_trait]
@@ -31,9 +34,15 @@ Resolution is asynchronous; the transport enforces timeout behavior around resol
 - If the destination taberna is unknown, fail immediately.
 
 The peering crate does not perform discovery, probing, or route computation.
-Resolvers do not report reachability or availability; they only map taberna IDs to a domus address
-or return `AureliaError` with `ErrorId::UnknownTaberna` (not found) or `ErrorId::PeerUnavailable`
-(resolver failure) with an optional message.
+Resolvers do not report reachability or availability; they only map taberna IDs
+to a domus address or return `AureliaError` with `ErrorId::UnknownTaberna` (not
+found) or `ErrorId::PeerUnavailable` (resolver failure) with an optional
+message.
+
+### Concrete Resolver Implementations
+
+Reusable resolver implementations are documented under `docs/resolver/`.
+`SimpleResolver` is defined in `docs/resolver/simple-resolver.md`.
 
 ### Transport Neutrality (Single Transport)
 

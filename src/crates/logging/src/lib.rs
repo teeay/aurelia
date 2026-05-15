@@ -5,5 +5,5 @@
 pub mod limited;
 
 pub use limited::{
-    init_limited_logging, log_ids, LimitedLogContext, LimitedLogControl, LimitedLogRegistry, LogId,
+    init_limited_logging, LimitedLogContext, LimitedLogControl, LimitedLogRegistry, LogId,
 };

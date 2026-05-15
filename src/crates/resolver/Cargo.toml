@@ -1,0 +1,25 @@
+# This file is part of the Aurelia workspace.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aurelia-resolver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+description = "Resolver implementations for Aurelia."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+aurelia-data = { path = "../data" }
+aurelia-ids = { path = "../ids" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

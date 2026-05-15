@@ -26,7 +26,7 @@ enum Cmd {
 
 #[derive(clap::Args)]
 struct PublishTreeArgs {
-    /// Skip the wipe step (debugging).
+    /// Skip the wipe step for debugging; stale files may remain.
     #[arg(long)]
     keep: bool,
     /// Run only build + cargo publish --dry-run, skipping fmt/test/clippy.
@@ -46,6 +46,12 @@ fn publish_tree(args: PublishTreeArgs) -> Result<()> {
     let cfg = config::PublishConfig::load(&metadata)?;
     let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
     let publish_root = workspace_root.join("publish").join(&cfg.target_crate);
+    if args.keep && publish_root.exists() {
+        eprintln!(
+            "publish-tree: warning: --keep is set and {} already exists; stale files may remain",
+            publish_root.display()
+        );
+    }
 
     generate::regenerate(&metadata, &cfg, &publish_root, args.keep)?;
     println!("publish-tree: regenerated {}", publish_root.display());

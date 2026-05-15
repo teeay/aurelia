@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    parse_behavior, Behavior, BehaviorState, RuntimeCommand, DEFAULT_SHUTDOWN_DOWNTIME_MS,
+    parse_behavior, Behavior, ControlState, RuntimeCommand, DEFAULT_SHUTDOWN_DOWNTIME_MS,
     MIN_SHUTDOWN_DOWNTIME_MS,
 };
 
@@ -33,18 +33,18 @@ pub(crate) enum ConnectionOutcome {
 /// this ordering: a successful TCP connect to `addr` is a strict precondition that A1 is up.
 pub async fn serve(
     addr: SocketAddr,
-    app: Arc<BehaviorState>,
+    state: Arc<ControlState>,
     runtime_tx: mpsc::Sender<RuntimeCommand>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), io::Error> {
     let listener = TcpListener::bind(addr).await?;
-    accept_loop(listener, app, runtime_tx, shutdown_rx).await;
+    accept_loop(listener, state, runtime_tx, shutdown_rx).await;
     Ok(())
 }
 
 async fn accept_loop(
     listener: TcpListener,
-    app: Arc<BehaviorState>,
+    state: Arc<ControlState>,
     runtime_tx: mpsc::Sender<RuntimeCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -59,11 +59,11 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer)) => {
-                        let app = Arc::clone(&app);
+                        let state = Arc::clone(&state);
                         let runtime_tx = runtime_tx.clone();
                         tokio::spawn(async move {
                             if matches!(
-                                process_request(stream, &app, &runtime_tx).await,
+                                process_request(stream, &state, &runtime_tx).await,
                                 ConnectionOutcome::Crash
                             ) {
                                 std::process::exit(2);
@@ -88,7 +88,7 @@ async fn accept_loop(
 /// no timer participates in this handshake.
 pub(crate) async fn process_request(
     stream: TcpStream,
-    app: &Arc<BehaviorState>,
+    state: &Arc<ControlState>,
     runtime_tx: &mpsc::Sender<RuntimeCommand>,
 ) -> ConnectionOutcome {
     let (read_half, mut write_half) = stream.into_split();
@@ -105,7 +105,7 @@ pub(crate) async fn process_request(
             if !buf.ends_with('\n') {
                 Err("oversize".to_string())
             } else {
-                dispatch(buf.trim_end_matches(&['\r', '\n'][..]), app, runtime_tx).await
+                dispatch(buf.trim_end_matches(&['\r', '\n'][..]), state, runtime_tx).await
             }
         }
     };
@@ -154,7 +154,7 @@ pub(crate) enum DispatchOutcome {
 
 pub(crate) async fn dispatch(
     line: &str,
-    app: &Arc<BehaviorState>,
+    state: &Arc<ControlState>,
     runtime_tx: &mpsc::Sender<RuntimeCommand>,
 ) -> Result<DispatchOutcome, String> {
     let mut parts = line.split_whitespace();
@@ -168,13 +168,12 @@ pub(crate) async fn dispatch(
         }
         "set" => {
             let target = parts.next().ok_or_else(|| "missing target".to_string())?;
-            if target != "app" {
+            if target != "app" && target != "actix" {
                 return Err(format!("unknown target {target}"));
             }
             let behavior_token = parts.next().ok_or_else(|| "missing behavior".to_string())?;
             let behavior = parse_behavior(behavior_token)
                 .ok_or_else(|| format!("unknown behavior {behavior_token}"))?;
-            app.set(behavior).await;
             if behavior == Behavior::Block {
                 if let Some(duration_token) = parts.next() {
                     let duration_ms: u64 = duration_token
@@ -184,27 +183,79 @@ pub(crate) async fn dispatch(
                         return Err("set takes at most three arguments".to_string());
                     }
                     if duration_ms > 0 {
-                        let app_for_timer = Arc::clone(app);
+                        let state_for_timer = Arc::clone(state);
+                        let target = target.to_string();
                         tokio::spawn(async move {
+                            // aurelia-test-allow-sleep: behavior-duration; the OOB command
+                            // explicitly requests this block duration before automatic restore.
                             tokio::time::sleep(Duration::from_millis(duration_ms)).await;
-                            app_for_timer.set(Behavior::Normal).await;
+                            set_target(&state_for_timer, &target, Behavior::Normal).await;
                         });
                     }
                 }
             } else if parts.next().is_some() {
                 return Err("set takes at most three arguments".to_string());
             }
+            set_target(state, target, behavior).await;
+            Ok(DispatchOutcome::Ok)
+        }
+        "stop" => {
+            let target = parts.next().ok_or_else(|| "missing target".to_string())?;
+            if target != "actix" {
+                return Err(format!("unknown target {target}"));
+            }
+            if parts.next().is_some() {
+                return Err("stop actix takes no extra arguments".to_string());
+            }
+            state.actix.stop_actor().await?;
+            Ok(DispatchOutcome::Ok)
+        }
+        "arm" => {
+            let target = parts.next().ok_or_else(|| "missing target".to_string())?;
+            if target != "app" {
+                return Err(format!("unknown target {target}"));
+            }
+            let event = parts.next().ok_or_else(|| "missing event".to_string())?;
+            if event != "blob-started" {
+                return Err(format!("unknown event {event}"));
+            }
+            if parts.next().is_some() {
+                return Err("arm app blob-started takes no extra arguments".to_string());
+            }
+            state.app.arm_blob_started();
+            Ok(DispatchOutcome::Ok)
+        }
+        "wait" => {
+            let target = parts.next().ok_or_else(|| "missing target".to_string())?;
+            if target != "app" && target != "actix" {
+                return Err(format!("unknown target {target}"));
+            }
+            let event = parts.next().ok_or_else(|| "missing event".to_string())?;
+            let timeout_token = parts.next().ok_or_else(|| "missing timeout".to_string())?;
+            let timeout_ms: u64 = timeout_token
+                .parse()
+                .map_err(|_| format!("invalid timeout {timeout_token}"))?;
+            if parts.next().is_some() {
+                return Err("wait takes exactly three arguments".to_string());
+            }
+            let timeout_duration = Duration::from_millis(timeout_ms);
+            match (target, event) {
+                ("app", "blocked") => state.app.wait_blocked(timeout_duration).await?,
+                ("app", "blob-started") => state.app.wait_blob_started(timeout_duration).await?,
+                ("actix", "blocked") => state.actix.wait_blocked(timeout_duration).await?,
+                _ => return Err(format!("unknown event {event}")),
+            }
             Ok(DispatchOutcome::Ok)
         }
         "unblock" => {
             let target = parts.next().ok_or_else(|| "missing target".to_string())?;
-            if target != "app" {
+            if target != "app" && target != "actix" {
                 return Err(format!("unknown target {target}"));
             }
             if parts.next().is_some() {
                 return Err("unblock takes no extra arguments".to_string());
             }
-            app.set(Behavior::Normal).await;
+            set_target(state, target, Behavior::Normal).await;
             Ok(DispatchOutcome::Ok)
         }
         "shutdown" => {
@@ -245,6 +296,14 @@ pub(crate) async fn dispatch(
             Ok(DispatchOutcome::Ok)
         }
         other => Err(format!("unknown command {other}")),
+    }
+}
+
+async fn set_target(state: &Arc<ControlState>, target: &str, behavior: Behavior) {
+    match target {
+        "app" => state.app.set(behavior).await,
+        "actix" => state.actix.set(behavior).await,
+        _ => {}
     }
 }
 

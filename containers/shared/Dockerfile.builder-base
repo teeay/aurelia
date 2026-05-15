@@ -1,0 +1,17 @@
+# This file is part of the Aurelia workspace.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+FROM rust:1-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && mkdir -p /workspace \
+    && chown appuser:appuser /workspace
+
+WORKDIR /workspace
+USER appuser

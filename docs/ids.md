@@ -3,6 +3,8 @@
 This document is the canonical list of IDs used across the Aurelia workspace.
 All crates must reference this file when defining, consuming, or documenting IDs.
 All ID definitions are implemented in the internal `aurelia-ids` crate (`src/crates/ids`).
+The public `aurelia` crate re-exports shared ID and error API directly from `aurelia-ids` so
+cross-layer identifiers do not appear to be owned by the A1 peering implementation.
 
 Error semantics are tracked in `docs/errors.md`. This document remains the authoritative
 source for ID values and ranges.
@@ -29,6 +31,18 @@ Ranges are defined as:
 - **A2 (Aurelia services):** `0x0001_0000` - `0x00FF_FFFF`
 - **A3 (application):** `0x0100_0000` - `0xFFFF_FFFF`
 
+The priority range constants and classifier are implemented in `aurelia-ids`. Peering and any
+future workspace crate that needs message priority classification must call the shared classifier
+instead of duplicating raw numeric range checks.
+
+Applications and tests must not hand-write low numeric message type IDs for A3 traffic. Use the
+public `a3_message_type(offset)` helper, re-exported by `aurelia`, to derive application message
+types from the A3 base. `a3_message_type(0)` returns `0x0100_0000`; `try_a3_message_type(offset)`
+returns `None` if the offset would exceed the `u32` message type range.
+Public application sends must reject message types below `A3_MESSAGE_TYPE_BASE` before local
+delivery or remote routing. A2 message types are reserved for Aurelia service traffic and are not
+accepted from `MessageCodec::encode_app`.
+
 ### Transport-Reserved Message Type IDs (v1)
 
 IDs are assigned sequentially starting at `1`.
@@ -39,7 +53,7 @@ IDs are assigned sequentially starting at `1`.
 - `4`: ack
 - `5`: close
 - `6`: error
-- `7`: blob-transfer-start
+- `7`: reserved
 - `8`: blob-transfer-chunk
 - `9`: blob-transfer-complete
 
@@ -53,6 +67,9 @@ Header flags are defined in `docs/peering/wire-protocol.md`.
 ### Peering Error IDs (v1)
 
 IDs are assigned sequentially starting at `1`.
+The `aurelia-ids` crate defines `ErrorId` with the same macro-generated pattern used for `LogId`;
+`ErrorId::ALL`, `ErrorId::as_u32`, and `TryFrom<u32>` are generated from the variant list so the
+numeric registry cannot drift from the enum definition.
 
 - `1`: unknown-taberna
 - `2`: local-queue-full
@@ -78,10 +95,12 @@ IDs are assigned sequentially starting at `1`.
 - `22`: invalid-config
 - `23`: domus-closed
 - `24`: receive-timeout
+- `25`: snapshot-not-available
+- `26`: taberna-shutdown
 
 ### Error Message Limits
 
-- Error messages must be UTF-8 and bounded to a maximum of 1024 characters.
+- Error messages must be UTF-8 and bounded to a maximum of 1024 bytes.
 
 ## Logging (Rate-Limited)
 
@@ -91,6 +110,9 @@ workspace.
 - `1001`: inbound-handshake-hard-limit-reached
 - `1002`: inbound-handshake-per-peer-limit-rejected
 - `1003`: per-peer-callis-limit-rejected
+- `1004`: outbound-ready-queue-overrun
+- `1005`: duplicate-outbound-ack-response
+- `1006`: duplicate-outbound-error-response
 
 If an ID is used by any crate, it must be listed here with its type and purpose.
 

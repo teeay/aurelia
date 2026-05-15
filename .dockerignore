@@ -4,4 +4,16 @@
 
 .git
 target
+**/target
+testing/peering/apps/*/Cargo.lock
 tmp
+tmp/**
+publish
+publish/**
+*.log
+.DS_Store
+.idea
+.vscode
+.cache
+node_modules
+**/node_modules

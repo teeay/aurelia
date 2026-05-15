@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
 use super::{BlobManager, BlobReceiverState};
-use crate::ring_buffer::OutboundRingBuffer;
+use crate::ring_buffer::{OutboundRingBuffer, TryPushAvailable};
 use aurelia_ids::PeerMessageId;
 use aurelia_ids::{AureliaError, ErrorId};
 
@@ -30,6 +30,49 @@ enum ReadOutcome {
     Chunk(Bytes),
     Eof,
     Error(AureliaError),
+}
+
+async fn try_receiver_read(
+    blob: &BlobManager,
+    receiver: &BlobReceiverState,
+    stream_id: PeerMessageId,
+) -> Option<ReadOutcome> {
+    if let Some(err) = receiver.error.lock().await.clone() {
+        return Some(ReadOutcome::Error(err));
+    }
+    let ring = blob.recv_ring(stream_id).await;
+    if let Some(ring) = ring {
+        if let Some(chunk) = ring.take_next().await {
+            receiver.notify.notify_waiters();
+            return Some(ReadOutcome::Chunk(chunk));
+        }
+        if receiver.completed.load(std::sync::atomic::Ordering::SeqCst) && ring.is_complete().await
+        {
+            let _ = blob.remove_recv_stream(stream_id).await;
+            blob.note_recv_complete(stream_id, receiver.completion_ttl)
+                .await;
+            return Some(ReadOutcome::Eof);
+        }
+    } else {
+        if let Some(err) = receiver.error.lock().await.clone() {
+            return Some(ReadOutcome::Error(err));
+        }
+        if receiver.completed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Some(ReadOutcome::Eof);
+        }
+    }
+    None
+}
+
+async fn fail_receiver_idle(
+    blob: &BlobManager,
+    receiver: &BlobReceiverState,
+    stream_id: PeerMessageId,
+) -> ReadOutcome {
+    let err = AureliaError::new(ErrorId::BlobStreamIdleTimeout);
+    receiver.fail(err.clone()).await;
+    let _ = blob.remove_recv_stream(stream_id).await;
+    ReadOutcome::Error(err)
 }
 
 impl BlobReceiverStream {
@@ -59,63 +102,26 @@ impl BlobReceiverStream {
             loop {
                 if !receiver.accepted.load(std::sync::atomic::Ordering::SeqCst) {
                     let notified = receiver.notify.notified();
-                    if timeout(idle_timeout, notified).await.is_err() {
-                        let err = AureliaError::new(ErrorId::BlobStreamIdleTimeout);
-                        {
-                            let mut guard = receiver.error.lock().await;
-                            *guard = Some(err.clone());
-                        }
-                        receiver
-                            .completed
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        receiver.notify.notify_waiters();
-                        let _ = blob.remove_recv_stream(stream_id).await;
-                        return ReadOutcome::Error(err);
+                    tokio::pin!(notified);
+                    if receiver.accepted.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
+                    if timeout(idle_timeout, &mut notified).await.is_err() {
+                        return fail_receiver_idle(&blob, &receiver, stream_id).await;
                     }
                     continue;
                 }
-                if let Some(err) = receiver.error.lock().await.clone() {
-                    return ReadOutcome::Error(err);
-                }
-                let ring = {
-                    let recv = blob.recv_streams.lock().await;
-                    recv.get(&stream_id)
-                        .map(|state| std::sync::Arc::clone(&state.ring))
-                };
-                if let Some(ring) = ring {
-                    if let Some(chunk) = ring.take_next().await {
-                        receiver.notify.notify_waiters();
-                        return ReadOutcome::Chunk(chunk);
-                    }
-                    if receiver.completed.load(std::sync::atomic::Ordering::SeqCst)
-                        && ring.is_complete().await
-                    {
-                        let _ = blob.remove_recv_stream(stream_id).await;
-                        blob.note_recv_complete(stream_id, receiver.completion_ttl)
-                            .await;
-                        return ReadOutcome::Eof;
-                    }
-                } else {
-                    if let Some(err) = receiver.error.lock().await.clone() {
-                        return ReadOutcome::Error(err);
-                    }
-                    if receiver.completed.load(std::sync::atomic::Ordering::SeqCst) {
-                        return ReadOutcome::Eof;
-                    }
+
+                if let Some(outcome) = try_receiver_read(&blob, &receiver, stream_id).await {
+                    return outcome;
                 }
                 let notified = receiver.notify.notified();
-                if timeout(idle_timeout, notified).await.is_err() {
-                    let err = AureliaError::new(ErrorId::BlobStreamIdleTimeout);
-                    {
-                        let mut guard = receiver.error.lock().await;
-                        *guard = Some(err.clone());
-                    }
-                    receiver
-                        .completed
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    receiver.notify.notify_waiters();
-                    let _ = blob.remove_recv_stream(stream_id).await;
-                    return ReadOutcome::Error(err);
+                tokio::pin!(notified);
+                if let Some(outcome) = try_receiver_read(&blob, &receiver, stream_id).await {
+                    return outcome;
+                }
+                if timeout(idle_timeout, &mut notified).await.is_err() {
+                    return fail_receiver_idle(&blob, &receiver, stream_id).await;
                 }
             }
         }));
@@ -191,17 +197,9 @@ impl Drop for BlobReceiverStream {
                 return;
             }
             let err = AureliaError::new(ErrorId::PeerUnavailable);
-            let _ = blob.send_stream_error(stream_id, err.clone()).await;
             let _ = blob.remove_recv_stream(stream_id).await;
             blob.drop_pending_request(stream_id).await;
-            {
-                let mut guard = receiver.error.lock().await;
-                *guard = Some(err);
-            }
-            receiver
-                .completed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            receiver.notify.notify_waiters();
+            receiver.fail(err).await;
         });
     }
 }
@@ -222,7 +220,7 @@ struct BlobSenderState {
 
 #[derive(Clone, Copy)]
 enum PendingKind {
-    Write(usize),
+    Capacity,
     Flush,
     Shutdown,
 }
@@ -254,19 +252,18 @@ impl BlobSenderStream {
         }
     }
 
-    fn start_write(&mut self, data: Bytes, len: usize) {
+    fn start_capacity_wait(&mut self) {
         let state = std::sync::Arc::clone(&self.state);
         let future = async move {
             let state = state.lock().await;
             if state.closed {
                 return Err(AureliaError::new(ErrorId::PeerUnavailable));
             }
-            state.ring.push_bytes(&data, state.send_timeout).await?;
-            state.blob.notify_dispatch();
-            Ok(())
+            let deadline = tokio::time::Instant::now() + state.send_timeout;
+            state.ring.wait_for_capacity(deadline).await
         };
         self.pending = Some(PendingOp {
-            kind: PendingKind::Write(len),
+            kind: PendingKind::Capacity,
             future: Box::pin(future),
         });
     }
@@ -295,7 +292,7 @@ impl BlobSenderStream {
                 return Ok(());
             }
             state.ring.seal(state.send_timeout).await?;
-            state.blob.notify_dispatch();
+            state.blob.notify_work();
 
             let deadline = tokio::time::Instant::now() + state.send_timeout;
             if let Err(err) = state.ring.wait_for_complete(deadline).await {
@@ -338,8 +335,8 @@ impl AsyncWrite for BlobSenderStream {
                         if let Err(err) = result {
                             return Poll::Ready(Err(std::io::Error::other(err.to_string())));
                         }
-                        if let PendingKind::Write(len) = kind {
-                            return Poll::Ready(Ok(len));
+                        if let PendingKind::Capacity = kind {
+                            continue;
                         }
                         continue;
                     }
@@ -349,9 +346,35 @@ impl AsyncWrite for BlobSenderStream {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let data = Bytes::copy_from_slice(buf);
-            let len = data.len();
-            self.start_write(data, len);
+            let state = match self.state.try_lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            };
+            if state.closed {
+                return Poll::Ready(Err(std::io::Error::other(
+                    AureliaError::new(ErrorId::PeerUnavailable).to_string(),
+                )));
+            }
+            let blob = std::sync::Arc::clone(&state.blob);
+            let result = state.ring.try_push_available(buf, || blob.notify_work());
+            drop(state);
+            match result {
+                Ok(TryPushAvailable::Accepted { bytes }) => {
+                    blob.notify_work();
+                    return Poll::Ready(Ok(bytes));
+                }
+                Ok(TryPushAvailable::Full) => {
+                    self.start_capacity_wait();
+                }
+                Ok(TryPushAvailable::Busy) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(err) => return Poll::Ready(Err(std::io::Error::other(err.to_string()))),
+            }
         }
     }
 
@@ -370,7 +393,7 @@ impl AsyncWrite for BlobSenderStream {
                             PendingKind::Flush | PendingKind::Shutdown => {
                                 return Poll::Ready(Ok(()));
                             }
-                            PendingKind::Write(_) => continue,
+                            PendingKind::Capacity => continue,
                         }
                     }
                 }
@@ -411,8 +434,6 @@ impl Drop for BlobSenderStream {
             if state.closed {
                 return;
             }
-            let err = AureliaError::new(ErrorId::PeerUnavailable);
-            let _ = state.blob.send_stream_error(state.stream_id, err).await;
             state.cleanup().await;
         });
     }

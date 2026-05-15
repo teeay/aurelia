@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Zivatar Limited
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,24 +10,75 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, SanType};
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use aurelia_peering::{AureliaError, EncodedMessage, Pkcs8AuthConfig, Pkcs8DerConfig};
+use aurelia_data::{DomusAddr, RouteResolver};
 use aurelia_peering::{
-    DomusAddr, DomusAuthConfig, DomusBuilder, DomusConfig, DomusReportingEvent, ErrorId,
-    MessageCodec, SendOptions, SimpleResolver, TabernaId,
+    a3_message_type, AureliaError, EncodedMessage, Pkcs8AuthConfig, Pkcs8DerConfig,
+};
+use aurelia_peering::{
+    DomusBuilder, DomusConfig, DomusReportingEvent, ErrorId, MessageCodec, MessageType,
+    SendOptions, TabernaId,
 };
 
+static TEMP_DIR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct TempSocketDir {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for TempSocketDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for TempSocketDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 struct TestCodec;
+
+#[derive(Default)]
+struct TestResolver {
+    routes: RwLock<HashMap<TabernaId, DomusAddr>>,
+}
+
+impl TestResolver {
+    async fn insert(&self, taberna_id: TabernaId, domus: DomusAddr) {
+        let mut guard = self.routes.write().await;
+        guard.insert(taberna_id, domus);
+    }
+}
+
+#[async_trait::async_trait]
+impl RouteResolver for TestResolver {
+    async fn resolve(&self, taberna_id: TabernaId) -> Result<DomusAddr, AureliaError> {
+        let guard = self.routes.read().await;
+        guard
+            .get(&taberna_id)
+            .cloned()
+            .ok_or_else(|| AureliaError::new(ErrorId::UnknownTaberna))
+    }
+}
 
 impl MessageCodec for TestCodec {
     type AppMessage = Bytes;
 
     fn encode_app(&self, msg: &Self::AppMessage) -> Result<EncodedMessage, AureliaError> {
-        Ok(EncodedMessage::new(100, msg.clone()))
+        Ok(EncodedMessage::new(a3_message_type(100), msg.clone()))
     }
 
-    fn decode_app(&self, _msg_type: u32, payload: &[u8]) -> Result<Self::AppMessage, AureliaError> {
+    fn decode_app(
+        &self,
+        _msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<Self::AppMessage, AureliaError> {
         Ok(Bytes::copy_from_slice(payload))
     }
 }
@@ -47,31 +99,24 @@ fn build_domus_cert(ca: &Certificate, path: &Path) -> (Vec<u8>, Vec<u8>) {
     (cert_der, key_der)
 }
 
-fn build_auth(ca: &Certificate, path: &Path) -> DomusAuthConfig {
+fn build_auth(ca: &Certificate, path: &Path) -> Pkcs8AuthConfig {
     let (cert_der, key_der) = build_domus_cert(ca, path);
-    DomusAuthConfig::Pkcs8(Pkcs8AuthConfig::Pkcs8Der(Pkcs8DerConfig {
+    Pkcs8AuthConfig::Pkcs8Der(Pkcs8DerConfig {
         ca_der: ca.serialize_der().expect("ca der"),
         cert_der,
-        pkcs8_key_der: key_der,
-    }))
+        pkcs8_key_der: key_der.into(),
+    })
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let root = workspace_root().join("tmp/peering-observability");
-    let dir = root.join(name);
+fn temp_dir(name: &str) -> TempSocketDir {
+    let count = TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = name;
+    let dir = PathBuf::from("/tmp").join(format!("au-obs-{}-{count}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
-    fs::canonicalize(&dir).expect("canonicalize temp dir")
-}
-
-fn workspace_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .and_then(|dir| dir.parent())
-        .and_then(|dir| dir.parent())
-        .map(PathBuf::from)
-        .expect("workspace root")
+    TempSocketDir {
+        path: fs::canonicalize(&dir).expect("canonicalize temp dir"),
+    }
 }
 
 #[tokio::test]
@@ -84,8 +129,8 @@ async fn domus_reporting_connected_peers_and_events() {
     let auth_a = build_auth(&ca, &path_a);
     let auth_b = build_auth(&ca, &path_b);
 
-    let resolver_a = Arc::new(SimpleResolver::new());
-    let resolver_b = Arc::new(SimpleResolver::new());
+    let resolver_a = Arc::new(TestResolver::default());
+    let resolver_b = Arc::new(TestResolver::default());
     let taberna_id: TabernaId = 42;
     resolver_a
         .insert(taberna_id, DomusAddr::Socket(path_b.clone()))
@@ -100,7 +145,6 @@ async fn domus_reporting_connected_peers_and_events() {
         DomusAddr::Socket(path_a.clone()),
         auth_a,
         resolver_a,
-        tokio::runtime::Handle::current(),
     )
     .build_with_reporting()
     .await
@@ -111,7 +155,6 @@ async fn domus_reporting_connected_peers_and_events() {
         DomusAddr::Socket(path_b.clone()),
         auth_b,
         resolver_b,
-        tokio::runtime::Handle::current(),
     )
     .build()
     .await
@@ -127,7 +170,7 @@ async fn domus_reporting_connected_peers_and_events() {
             .next(Some(Duration::from_secs(30)))
             .await
             .expect("taberna next");
-        let _ = request.accept().await;
+        request.accept();
     });
 
     domus_a
@@ -156,7 +199,11 @@ async fn domus_reporting_connected_peers_and_events() {
         DomusReportingEvent::PeerConnectedEvent { .. }
     ));
 
-    let peers = domus_a.reporting().connected_peer_identities().await;
+    let peers = domus_a
+        .reporting()
+        .connected_peer_identities()
+        .await
+        .expect("connected peer identities");
     assert!(peers.contains(&DomusAddr::Socket(path_b.clone())));
 
     let _ = taberna_task.await;
@@ -172,7 +219,7 @@ async fn domus_reporting_emits_address_mismatch_error() {
     let ca = build_ca();
     let auth_a = build_auth(&ca, &path_a);
 
-    let resolver_a = Arc::new(SimpleResolver::new());
+    let resolver_a = Arc::new(TestResolver::default());
     let taberna_id: TabernaId = 7;
     resolver_a
         .insert(
@@ -190,7 +237,6 @@ async fn domus_reporting_emits_address_mismatch_error() {
         DomusAddr::Socket(path_a.clone()),
         auth_a,
         resolver_a,
-        tokio::runtime::Handle::current(),
     )
     .build_with_reporting()
     .await

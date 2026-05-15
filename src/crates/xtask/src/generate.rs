@@ -31,6 +31,13 @@ pub fn regenerate(
         .into_iter()
         .find(|p| p.name.as_str() == cfg.target_crate.as_str())
         .ok_or_else(|| anyhow!("target crate not found"))?;
+    let target_manifest_dir = target_pkg
+        .manifest_path
+        .parent()
+        .unwrap()
+        .as_std_path()
+        .to_path_buf();
+    ensure_supported_crate_root(&target_pkg.name, &target_manifest_dir)?;
     let target_src = target_pkg
         .manifest_path
         .parent()
@@ -52,6 +59,13 @@ pub fn regenerate(
             .into_iter()
             .find(|p| p.name.as_str() == ic.name.as_str())
             .ok_or_else(|| anyhow!("internal crate `{}` not found", ic.name))?;
+        let manifest_dir = pkg
+            .manifest_path
+            .parent()
+            .unwrap()
+            .as_std_path()
+            .to_path_buf();
+        ensure_supported_crate_root(&pkg.name, &manifest_dir)?;
         let src = pkg
             .manifest_path
             .parent()
@@ -131,7 +145,6 @@ fn copy_rewriting(
     macro_regex: &Regex,
     self_module: Option<&str>,
 ) -> Result<()> {
-    let crate_path_regex = Regex::new(r"\bcrate::").unwrap();
     fs_err::create_dir_all(dest_dir)?;
     for entry in WalkDir::new(src_dir) {
         let entry = entry?;
@@ -147,9 +160,7 @@ fn copy_rewriting(
                 // do not double-prefix `crate::` paths produced by later
                 // stages.
                 let stage1 = match self_module {
-                    Some(module) => crate_path_regex
-                        .replace_all(&content, format!("crate::{}::", module).as_str())
-                        .into_owned(),
+                    Some(module) => retarget_crate_paths(&content, module),
                     None => content,
                 };
                 // Stage 2: macro invocations across configured internal crates
@@ -169,6 +180,66 @@ fn copy_rewriting(
     Ok(())
 }
 
+fn ensure_supported_crate_root(crate_name: &str, manifest_dir: &Path) -> Result<()> {
+    let build_rs = manifest_dir.join("build.rs");
+    if build_rs.exists() {
+        anyhow::bail!(
+            "crate `{}` contains build.rs, which is outside the current publish-tree source inclusion contract",
+            crate_name
+        );
+    }
+    Ok(())
+}
+
+fn retarget_crate_paths(content: &str, module: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    while let Some(offset) = content[cursor..].find("crate::") {
+        let start = cursor + offset;
+        let after = start + "crate::".len();
+        out.push_str(&content[cursor..start]);
+
+        if is_retargetable_crate_path(content, start) && !is_root_macro_invocation(content, after) {
+            out.push_str("crate::");
+            out.push_str(module);
+            out.push_str("::");
+        } else {
+            out.push_str("crate::");
+        }
+        cursor = after;
+    }
+    out.push_str(&content[cursor..]);
+    out
+}
+
+fn is_retargetable_crate_path(content: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    let Some(previous) = content[..start].chars().next_back() else {
+        return true;
+    };
+    previous != '$' && !previous.is_ascii_alphanumeric() && previous != '_'
+}
+
+fn is_root_macro_invocation(content: &str, mut cursor: usize) -> bool {
+    let Some(first) = content[cursor..].chars().next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    cursor += first.len_utf8();
+    while let Some(ch) = content[cursor..].chars().next() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            cursor += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    content[cursor..].starts_with('!')
+}
+
 fn inject_mod_declarations(lib_rs: &Path, crates: &[InternalCrate]) -> Result<()> {
     let content = fs_err::read_to_string(lib_rs)?;
     let mod_block: String = crates
@@ -176,37 +247,82 @@ fn inject_mod_declarations(lib_rs: &Path, crates: &[InternalCrate]) -> Result<()
         .map(|c| format!("mod {};\n", c.module))
         .collect();
 
-    // Skip leading regular comments, inner doc comments, blank lines, and
-    // inner attributes so the injected `mod` declarations land after the
-    // file-level `//!` block but before any item declarations.
-    let mut idx = 0usize;
-    let lines: Vec<&str> = content.split_inclusive('\n').collect();
-    while idx < lines.len() {
-        let trimmed = lines[idx].trim_start();
-        let is_line_comment = trimmed.starts_with("//");
-        let is_blank = trimmed.is_empty() || trimmed == "\n";
-        let is_attr = trimmed.starts_with("#![");
-        if is_line_comment || is_blank || is_attr {
-            idx += 1;
-        } else {
-            break;
-        }
-    }
-
-    let prefix: String = lines[..idx].iter().copied().collect();
-    let suffix: String = lines[idx..].iter().copied().collect();
+    let split = rust_file_header_end(&content);
+    let prefix = &content[..split];
+    let suffix = &content[split..];
 
     let mut new = String::new();
-    new.push_str(&prefix);
-    if !prefix.ends_with('\n') {
+    new.push_str(prefix);
+    if !prefix.is_empty() && !prefix.ends_with('\n') {
         new.push('\n');
     }
     new.push_str(&mod_block);
     new.push('\n');
-    new.push_str(&suffix);
+    new.push_str(suffix);
 
     fs_err::write(lib_rs, new)?;
     Ok(())
+}
+
+fn rust_file_header_end(content: &str) -> usize {
+    let mut cursor = 0usize;
+    loop {
+        let line_start = cursor;
+        while cursor < content.len() {
+            let ch = content[cursor..].chars().next().unwrap();
+            if ch.is_whitespace() && ch != '\n' {
+                cursor += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let trimmed_start = cursor;
+        let rest = &content[trimmed_start..];
+
+        if rest.is_empty() {
+            return content.len();
+        }
+        if rest.starts_with('\n') {
+            cursor = trimmed_start + 1;
+            continue;
+        }
+        if rest.starts_with("//") {
+            cursor = line_end_inclusive(content, trimmed_start);
+            continue;
+        }
+        if rest.starts_with("/*!") {
+            if let Some(end) = rest.find("*/") {
+                cursor = trimmed_start + end + 2;
+                cursor = consume_one_trailing_newline(content, cursor);
+                continue;
+            }
+            return content.len();
+        }
+        if rest.starts_with("#![") {
+            if let Some(end) = rest.find(']') {
+                cursor = trimmed_start + end + 1;
+                cursor = consume_one_trailing_newline(content, cursor);
+                continue;
+            }
+            return line_start;
+        }
+        return line_start;
+    }
+}
+
+fn line_end_inclusive(content: &str, start: usize) -> usize {
+    match content[start..].find('\n') {
+        Some(offset) => start + offset + 1,
+        None => content.len(),
+    }
+}
+
+fn consume_one_trailing_newline(content: &str, cursor: usize) -> usize {
+    if content[cursor..].starts_with('\n') {
+        cursor + 1
+    } else {
+        cursor
+    }
 }
 
 /// Prepends `#![allow(...)]` inner attributes to a merged internal-crate
@@ -240,3 +356,7 @@ fn prepend_inner_allow(mod_rs: &Path) -> Result<()> {
     fs_err::write(mod_rs, new)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/generate.rs"]
+mod tests;

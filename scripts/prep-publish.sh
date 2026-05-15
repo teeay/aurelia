@@ -12,8 +12,11 @@ cargo fmt --all -- --check
 echo "prep-publish: cargo build"
 cargo build --workspace --all-targets
 
+echo "prep-publish: test policy scan"
+scripts/testing/check-async-test-timeouts.py
+
 echo "prep-publish: cargo test"
-cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 
 echo "prep-publish: cargo clippy"
 cargo clippy --workspace --all-targets --all-features -- -D warnings

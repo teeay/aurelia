@@ -7,7 +7,7 @@ use aurelia_ids::{
 };
 use bytes::Buf;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
 
 fn decode_failure(message: impl Into<String>) -> AureliaError {
     AureliaError::with_message(ErrorId::DecodeFailure, message)
@@ -44,48 +44,50 @@ fn read_u64(buf: &mut &[u8], message: &'static str) -> Result<u64, AureliaError>
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct WireFlags: u16 {
+    pub(crate) struct WireFlags: u16 {
         const BLOB = 0x0001;
         const RECONNECT = 0x0002;
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HelloPayload {
-    pub chunk_size: Option<u32>,
-    pub ack_window_chunks: Option<u32>,
+pub(crate) enum HelloPayload {
+    Primary,
+    Blob {
+        chunk_size: u32,
+        ack_window_chunks: u32,
+    },
 }
 
 impl HelloPayload {
-    pub const PRIMARY_LEN: usize = 0;
-    pub const BLOB_LEN: usize = 8;
+    pub(crate) const PRIMARY_LEN: usize = 0;
+    pub(crate) const BLOB_LEN: usize = 8;
 
-    pub fn to_bytes(self) -> Vec<u8> {
-        match (self.chunk_size, self.ack_window_chunks) {
-            (Some(chunk_size), Some(ack_window)) => {
+    pub(crate) fn to_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Blob {
+                chunk_size,
+                ack_window_chunks,
+            } => {
                 let mut out = Vec::with_capacity(Self::BLOB_LEN);
                 out.extend_from_slice(&chunk_size.to_be_bytes());
-                out.extend_from_slice(&ack_window.to_be_bytes());
+                out.extend_from_slice(&ack_window_chunks.to_be_bytes());
                 out
             }
-            (None, None) => Vec::new(),
-            _ => unreachable!("hello payload must be primary or blob"),
+            Self::Primary => Vec::new(),
         }
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
         match bytes.len() {
-            Self::PRIMARY_LEN => Ok(Self {
-                chunk_size: None,
-                ack_window_chunks: None,
-            }),
+            Self::PRIMARY_LEN => Ok(Self::Primary),
             Self::BLOB_LEN => {
                 let mut buf = bytes;
                 let chunk_size = read_u32(&mut buf, "invalid hello payload length")?;
-                let ack_window = read_u32(&mut buf, "invalid hello payload length")?;
-                Ok(Self {
-                    chunk_size: Some(chunk_size),
-                    ack_window_chunks: Some(ack_window),
+                let ack_window_chunks = read_u32(&mut buf, "invalid hello payload length")?;
+                Ok(Self::Blob {
+                    chunk_size,
+                    ack_window_chunks,
                 })
             }
             _ => Err(decode_failure("invalid hello payload length")),
@@ -95,56 +97,23 @@ impl HelloPayload {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct BlobChunkFlags: u16 {
+    pub(crate) struct BlobChunkFlags: u16 {
         const LAST_CHUNK = 0x0001;
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlobTransferStartPayload {
-    pub request_msg_id: PeerMessageId,
-}
-
-impl BlobTransferStartPayload {
-    pub const LEN: usize = 4;
-
-    pub fn to_bytes(self) -> [u8; Self::LEN] {
-        self.request_msg_id.to_be_bytes()
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
-        if bytes.len() != Self::LEN {
-            return Err(decode_failure("invalid blob start payload length"));
-        }
-        let mut buf = bytes;
-        Ok(Self {
-            request_msg_id: read_u32(&mut buf, "invalid blob start payload length")?,
-        })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlobTransferChunkPayload {
-    pub request_msg_id: PeerMessageId,
-    pub chunk_id: u64,
-    pub flags: BlobChunkFlags,
-    pub chunk: bytes::Bytes,
+pub(crate) struct BlobTransferChunkPayload {
+    pub(crate) request_msg_id: PeerMessageId,
+    pub(crate) chunk_id: u64,
+    pub(crate) flags: BlobChunkFlags,
+    pub(crate) chunk: bytes::Bytes,
 }
 
 impl BlobTransferChunkPayload {
-    pub const HEADER_LEN: usize = 4 + 8 + 2 + 4;
+    pub(crate) const HEADER_LEN: usize = 4 + 8 + 2 + 4;
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::HEADER_LEN + self.chunk.len());
-        out.extend_from_slice(&self.request_msg_id.to_be_bytes());
-        out.extend_from_slice(&self.chunk_id.to_be_bytes());
-        out.extend_from_slice(&self.flags.bits().to_be_bytes());
-        out.extend_from_slice(&(self.chunk.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.chunk);
-        out
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
         if bytes.len() < Self::HEADER_LEN {
             return Err(decode_failure("invalid blob chunk payload length"));
         }
@@ -170,18 +139,18 @@ impl BlobTransferChunkPayload {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlobTransferCompletePayload {
-    pub request_msg_id: PeerMessageId,
+pub(crate) struct BlobTransferCompletePayload {
+    pub(crate) request_msg_id: PeerMessageId,
 }
 
 impl BlobTransferCompletePayload {
-    pub const LEN: usize = 4;
+    pub(crate) const LEN: usize = 4;
 
-    pub fn to_bytes(self) -> [u8; Self::LEN] {
+    pub(crate) fn to_bytes(self) -> [u8; Self::LEN] {
         self.request_msg_id.to_be_bytes()
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
         if bytes.len() != Self::LEN {
             return Err(decode_failure("invalid blob complete payload length"));
         }
@@ -193,13 +162,13 @@ impl BlobTransferCompletePayload {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ErrorPayload {
-    pub error_id: u32,
-    pub message: String,
+pub(crate) struct ErrorPayload {
+    pub(crate) error_id: u32,
+    pub(crate) message: String,
 }
 
 impl ErrorPayload {
-    pub fn new(error_id: u32, message: impl Into<String>) -> Self {
+    pub(crate) fn new(error_id: u32, message: impl Into<String>) -> Self {
         let mut message = message.into();
         if message.len() > ERROR_MESSAGE_MAX_LEN {
             let mut idx = ERROR_MESSAGE_MAX_LEN;
@@ -211,14 +180,14 @@ impl ErrorPayload {
         Self { error_id, message }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + self.message.len());
         out.extend_from_slice(&self.error_id.to_be_bytes());
         out.extend_from_slice(self.message.as_bytes());
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AureliaError> {
         if bytes.len() < 4 {
             return Err(decode_failure("invalid error payload length"));
         }
@@ -232,20 +201,22 @@ impl ErrorPayload {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WireHeader {
-    pub version: u16,
-    pub flags: u16,
-    pub msg_type: MessageType,
-    pub peer_msg_id: PeerMessageId,
-    pub src_taberna: TabernaId,
-    pub dst_taberna: TabernaId,
-    pub payload_len: u32,
+pub(crate) struct WireHeader {
+    pub(crate) version: u16,
+    pub(crate) flags: u16,
+    pub(crate) msg_type: MessageType,
+    pub(crate) peer_msg_id: PeerMessageId,
+    pub(crate) src_taberna: TabernaId,
+    pub(crate) dst_taberna: TabernaId,
+    pub(crate) payload_len: u32,
 }
 
 impl WireHeader {
-    pub const LEN: usize = 32;
+    pub(crate) const LEN: usize = 32;
 
-    pub fn encode(&self) -> [u8; Self::LEN] {
+    pub(crate) fn encode(&self) -> [u8; Self::LEN] {
+        // Keep encode as fixed-offset writes into a stack array. Decode benefits from
+        // cursor-style reads; encode benefits from direct, allocation-free layout writes.
         let mut out = [0u8; Self::LEN];
         out[0..2].copy_from_slice(&self.version.to_be_bytes());
         out[2..4].copy_from_slice(&self.flags.to_be_bytes());
@@ -257,7 +228,7 @@ impl WireHeader {
         out
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self, AureliaError> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, AureliaError> {
         if buf.len() != Self::LEN {
             return Err(decode_failure("invalid wire header length"));
         }

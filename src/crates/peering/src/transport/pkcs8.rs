@@ -25,28 +25,58 @@ pub(crate) fn parse_pkcs8_auth_material(
         }) => Ok(Pkcs8AuthMaterial {
             roots: vec![CertificateDer::from(ca_der)],
             certs: vec![CertificateDer::from(cert_der)],
-            key_der: Zeroizing::new(pkcs8_key_der),
+            key_der: pkcs8_key_der.into_zeroizing(),
         }),
         Pkcs8AuthConfig::Pkcs8Pem(Pkcs8PemConfig {
             ca_pem,
             cert_pem,
             pkcs8_key_pem,
         }) => {
-            let key_pem = Zeroizing::new(pkcs8_key_pem);
+            let key_pem = pkcs8_key_pem.into_zeroizing();
             let ca_certs = CertificateDer::pem_slice_iter(&ca_pem)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| AureliaError::new(ErrorId::ProtocolViolation))?;
+                .map_err(|err| {
+                    AureliaError::with_message(
+                        ErrorId::ProtocolViolation,
+                        format!("invalid CA PEM: {err}"),
+                    )
+                })?;
             let certs = CertificateDer::pem_slice_iter(&cert_pem)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| AureliaError::new(ErrorId::ProtocolViolation))?;
+                .map_err(|err| {
+                    AureliaError::with_message(
+                        ErrorId::ProtocolViolation,
+                        format!("invalid certificate PEM: {err}"),
+                    )
+                })?;
             let mut keys = PrivatePkcs8KeyDer::pem_slice_iter(&key_pem)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| AureliaError::new(ErrorId::ProtocolViolation))?;
-            let key = keys
-                .pop()
-                .ok_or_else(|| AureliaError::new(ErrorId::ProtocolViolation))?;
-            if !keys.is_empty() || ca_certs.is_empty() || certs.is_empty() {
-                return Err(AureliaError::new(ErrorId::ProtocolViolation));
+                .map_err(|err| {
+                    AureliaError::with_message(
+                        ErrorId::ProtocolViolation,
+                        format!("invalid PKCS#8 private key PEM: {err}"),
+                    )
+                })?;
+            let key = keys.pop().ok_or_else(|| {
+                AureliaError::with_message(ErrorId::ProtocolViolation, "missing PKCS#8 private key")
+            })?;
+            if !keys.is_empty() {
+                return Err(AureliaError::with_message(
+                    ErrorId::ProtocolViolation,
+                    "multiple PKCS#8 private keys",
+                ));
+            }
+            if ca_certs.is_empty() {
+                return Err(AureliaError::with_message(
+                    ErrorId::ProtocolViolation,
+                    "empty CA certificate chain",
+                ));
+            }
+            if certs.is_empty() {
+                return Err(AureliaError::with_message(
+                    ErrorId::ProtocolViolation,
+                    "empty certificate chain",
+                ));
             }
             Ok(Pkcs8AuthMaterial {
                 roots: ca_certs,

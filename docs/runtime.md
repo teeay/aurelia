@@ -15,16 +15,21 @@ Status: Developed
 
 ### Runtime Ownership
 
-- The Aurelia wrapper owns a single `tokio::runtime::Runtime` created once per process.
+- The internal `aurelia-platform` crate owns a single `tokio::runtime::Runtime` created once per
+  process.
 - The runtime is stored in a `static OnceLock<Runtime>` and never shut down early.
+- `OnceLock` is non-poisoning and is used here instead of `std::sync::Once`, which is prohibited by
+  the workspace concurrency policy for live library/runtime code.
 - The runtime handle is cloned and passed into all Aurelia subsystems that need to spawn background work.
 
 ### Runtime Usage Across Aurelia
 
-- The Aurelia wrapper ensures the runtime exists and remains alive for the lifetime of the process.
+- The Aurelia wrapper calls `aurelia_platform::runtime::ensure()` so application code still
+  initialises Aurelia through `Aurelia::new()`.
 - All Aurelia components must use the Aurelia runtime for background tasks and drop cleanup.
 - No Aurelia component may depend on an ambient runtime via `Handle::try_current()` for cleanup.
-- The runtime handle is strictly crate-internal and never part of the public API surface.
+- The runtime handle is strictly internal to the merged Aurelia library and never part of the
+  public API surface.
 - Any synchronous API that needs async work must schedule it onto the Aurelia runtime.
 
 ### Runtime Interaction With Application Runtimes

@@ -37,8 +37,8 @@ Mitigations:
 
 ### No Per-Peer Certificate Pinning
 
-A1 does not pin peer certificates or session nonces across callis. Each callis is admitted on its
-own A0 authentication. Any party that completes a valid mTLS / socket-auth handshake against the
+A1 does not pin peer certificates across callis. Each callis is admitted on its own A0
+authentication. Any party that completes a valid mTLS / socket-auth handshake against the
 configured CA is accepted as the peer at the resolved address.
 
 Risk acceptance:

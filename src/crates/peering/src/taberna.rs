@@ -21,7 +21,7 @@ const DEFAULT_NEXT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Object-safe trait implemented by every taberna's inbox so the transport
 /// can deliver inbound messages without naming the concrete codec type.
 #[async_trait::async_trait]
-pub trait TabernaInbox: Send + Sync {
+pub(crate) trait TabernaInbox: Send + Sync {
     /// Enqueues a decoded message for application consumption. Returns a
     /// oneshot the transport awaits to learn whether the application
     /// accepted, rejected, or timed out the message.
@@ -89,10 +89,24 @@ impl TabernaRegistry {
     }
 }
 
-struct TabernaRegistration {
+pub(crate) struct TabernaRegistration {
     taberna_id: TabernaId,
     registry: Arc<TabernaRegistry>,
     runtime_handle: tokio::runtime::Handle,
+}
+
+impl TabernaRegistration {
+    pub(crate) fn new(
+        taberna_id: TabernaId,
+        registry: Arc<TabernaRegistry>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            taberna_id,
+            registry,
+            runtime_handle,
+        }
+    }
 }
 
 impl Drop for TabernaRegistration {
@@ -119,45 +133,68 @@ where
     /// Inbound blob stream attached to this message, if the sender used
     /// [`crate::SendOptions::BLOB`].
     pub blob_receiver: Option<BlobReceiver>,
+    completion: TabernaCompletion,
+}
+
+/// Application-owned pieces of a split [`TabernaRequest`].
+///
+/// Splitting is useful when an adapter or application needs to move the decoded payload and
+/// complete the Aurelia delivery decision at a different boundary. Public callers can only accept
+/// or reject through [`TabernaCompletion`]; internal A1 paths own transport-specific outcomes.
+pub struct TabernaRequestParts<Codec: MessageCodec>
+where
+    Codec::AppMessage: Send + Sync + 'static,
+{
+    /// The decoded application message.
+    pub message: Codec::AppMessage,
+    /// Inbound blob stream attached to this message, if present.
+    pub blob_receiver: Option<BlobReceiver>,
+    /// Completion guard for the Aurelia delivery decision.
+    pub completion: TabernaCompletion,
+}
+
+/// Completion guard for a taberna request.
+///
+/// Dropping the guard without an explicit decision rejects the request with
+/// [`ErrorId::RemoteTabernaRejected`].
+pub struct TabernaCompletion {
     response: Option<oneshot::Sender<Result<(), AureliaError>>>,
     notify: Option<Arc<Notify>>,
 }
 
-impl<Codec: MessageCodec> TabernaRequest<Codec>
-where
-    Codec::AppMessage: Send + Sync + 'static,
-{
-    /// Acknowledges this request, signalling success back to the sender.
-    pub async fn accept(mut self) -> Result<(), AureliaError> {
-        if let Some(response) = self.response.take() {
-            let result = response
-                .send(Ok(()))
-                .map_err(|_| AureliaError::new(ErrorId::RemoteTabernaRejected));
-            self.notify();
-            return result;
-        }
-        self.notify();
-        Err(AureliaError::new(ErrorId::RemoteTabernaRejected))
+impl TabernaCompletion {
+    /// Acknowledges the request as accepted by the local application boundary.
+    ///
+    /// This is a fire-and-complete operation. Sender-side wait, timeout, shutdown, and
+    /// cancellation state is owned by A1 and is not surfaced to the accepting application.
+    pub fn accept(self) {
+        self.complete(Ok(()));
     }
 
-    /// Rejects this request with `err`, propagated to the sender.
-    pub async fn reject(mut self, err: AureliaError) {
-        if let Some(response) = self.response.take() {
-            let _ = response.send(Err(err));
-        }
-        self.notify();
+    /// Rejects the request with [`ErrorId::RemoteTabernaRejected`].
+    ///
+    /// Rejection does not return a result because there is no useful caller action if the
+    /// sender-side waiter is no longer present.
+    pub fn reject(self) {
+        self.complete(Err(AureliaError::new(ErrorId::RemoteTabernaRejected)));
     }
 
-    fn expire(mut self) {
-        if let Some(response) = self.response.take() {
-            let _ = response.send(Err(AureliaError::new(ErrorId::TabernaBusy)));
-        }
-        self.notify();
+    pub(crate) fn busy(self) {
+        self.complete(Err(AureliaError::new(ErrorId::TabernaBusy)));
     }
 
-    fn shutdown(mut self) {
+    pub(crate) fn domus_closed(self) {
+        self.complete(Err(AureliaError::new(ErrorId::DomusClosed)));
+    }
+
+    #[cfg(feature = "actix")]
+    pub(crate) fn taberna_shutdown(self) {
+        self.complete(Err(AureliaError::new(ErrorId::TabernaShutdown)));
+    }
+
+    fn complete(mut self, result: Result<(), AureliaError>) {
         if let Some(response) = self.response.take() {
-            let _ = response.send(Err(AureliaError::new(ErrorId::DomusClosed)));
+            let _ = response.send(result);
         }
         self.notify();
     }
@@ -169,16 +206,76 @@ where
     }
 }
 
-impl<Codec: MessageCodec> Drop for TabernaRequest<Codec>
-where
-    Codec::AppMessage: Send + Sync + 'static,
-{
+impl Drop for TabernaCompletion {
     fn drop(&mut self) {
         if let Some(response) = self.response.take() {
             let _ = response.send(Err(AureliaError::new(ErrorId::RemoteTabernaRejected)));
+            self.notify();
         }
-        if let Some(notify) = self.notify.as_ref() {
-            notify.notify_one();
+    }
+}
+
+impl<Codec: MessageCodec> TabernaRequest<Codec>
+where
+    Codec::AppMessage: Send + Sync + 'static,
+{
+    pub(crate) fn new(
+        message: Codec::AppMessage,
+        blob_receiver: Option<BlobReceiver>,
+        response: oneshot::Sender<Result<(), AureliaError>>,
+        notify: Option<Arc<Notify>>,
+    ) -> Self {
+        Self {
+            message,
+            blob_receiver,
+            completion: TabernaCompletion {
+                response: Some(response),
+                notify,
+            },
+        }
+    }
+
+    /// Acknowledges this request as accepted at the local application boundary.
+    ///
+    /// This is a fire-and-complete operation. Sender-side wait, timeout, shutdown, and
+    /// cancellation state is owned by A1 and is not surfaced to the accepting application.
+    pub fn accept(self) {
+        let Self { completion, .. } = self;
+        completion.accept();
+    }
+
+    /// Rejects this request, signalling [`ErrorId::RemoteTabernaRejected`]
+    /// back to the sender. Application-specific failure details should travel
+    /// in application-level response payloads, not A1 error codes.
+    ///
+    /// Rejection does not return a result because there is no useful caller action if the
+    /// sender-side waiter is no longer present.
+    pub fn reject(self) {
+        let Self { completion, .. } = self;
+        completion.reject();
+    }
+
+    fn expire(self) {
+        let Self { completion, .. } = self;
+        completion.busy();
+    }
+
+    fn shutdown(self) {
+        let Self { completion, .. } = self;
+        completion.domus_closed();
+    }
+
+    /// Splits the request into application payload and completion guard without copying.
+    pub fn into_parts(self) -> TabernaRequestParts<Codec> {
+        let Self {
+            message,
+            blob_receiver,
+            completion,
+        } = self;
+        TabernaRequestParts {
+            message,
+            blob_receiver,
+            completion,
         }
     }
 }
@@ -188,25 +285,14 @@ where
 /// decoded with that codec and surfaced as [`TabernaRequest`]s via
 /// [`Taberna::next`].
 ///
-/// Tabernas are constructed with `Domus::taberna`; dropping a
-/// [`Taberna`] unregisters it from the parent domus.
+/// Tabernas are constructed with `Domus::taberna`; dropping a [`Taberna`] schedules
+/// deregistration from the parent domus. The taberna ID becomes available for reuse once the
+/// spawned deregistration task completes.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```no_run
-/// # use aurelia::{AureliaError, MessageCodec, EncodedMessage};
-/// # struct MyCodec;
-/// # impl MessageCodec for MyCodec {
-/// #     type AppMessage = ();
-/// #     fn encode_app(&self, _: &()) -> Result<EncodedMessage, AureliaError> { unimplemented!() }
-/// #     fn decode_app(&self, _: u32, _: &[u8]) -> Result<(), AureliaError> { unimplemented!() }
-/// # }
-/// # async fn example<RR: aurelia::RouteResolver>(domus: aurelia::Domus<RR>) -> Result<(), AureliaError> {
-/// let taberna = domus.taberna(42, MyCodec).await?;
-/// let request = taberna.next(None).await?;
-/// request.accept().await?;
-/// # Ok(()) }
-/// ```
+/// Usage examples live in the main `aurelia` crate docs to ensure doctests
+/// compile at the library API level.
 pub struct Taberna<Codec: MessageCodec>
 where
     Codec::AppMessage: Send + Sync + 'static,
@@ -227,11 +313,11 @@ where
     ) -> Self {
         Self {
             inbox,
-            _registration: Arc::new(TabernaRegistration {
+            _registration: Arc::new(TabernaRegistration::new(
                 taberna_id,
                 registry,
                 runtime_handle,
-            }),
+            )),
         }
     }
 
@@ -294,10 +380,10 @@ where
         }
     }
 
-    async fn refresh_limits(&self) {
-        let config = self.config.snapshot().await;
-        let next_size = config.taberna_accept_queue_size;
-        let next_ttl = config.accept_timeout;
+    fn refresh_limits(&self) {
+        let limits = self.config.taberna_limits();
+        let next_size = limits.accept_queue_size;
+        let next_ttl = limits.accept_timeout;
         if self.last_queue_size.load(Ordering::SeqCst) != next_size {
             self.sender.update_capacity(next_size);
             self.last_queue_size.store(next_size, Ordering::SeqCst);
@@ -322,18 +408,13 @@ where
         blob_receiver: Option<BlobReceiver>,
         notify: Option<Arc<Notify>>,
     ) -> Result<oneshot::Receiver<Result<(), AureliaError>>, AureliaError> {
-        self.refresh_limits().await;
+        self.refresh_limits();
         let message = self
             .codec
             .decode_app(msg_type, payload.as_ref())
             .map_err(|err| AureliaError::with_message(ErrorId::DecodeFailure, err.to_string()))?;
         let (response_tx, response_rx) = oneshot::channel();
-        let request = TabernaRequest {
-            message,
-            blob_receiver,
-            response: Some(response_tx),
-            notify,
-        };
+        let request = TabernaRequest::new(message, blob_receiver, response_tx, notify);
         match self.sender.send(request) {
             Ok(()) => Ok(response_rx),
             Err(CaducusError {
@@ -354,44 +435,48 @@ where
     }
 }
 
-pub(crate) struct TabernaExpiryReport<Codec: MessageCodec>
+pub(crate) trait TabernaTermination<Codec: MessageCodec>
 where
     Codec::AppMessage: Send + Sync + 'static,
 {
-    _marker: PhantomData<Codec>,
+    fn terminate(item: TabernaRequest<Codec>);
 }
 
-impl<Codec: MessageCodec> TabernaExpiryReport<Codec>
-where
-    Codec::AppMessage: Send + Sync + 'static,
-{
-    fn new() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
+pub(crate) struct ExpireTabernaRequest;
+pub(crate) struct ShutdownTabernaRequest;
 
-impl<Codec: MessageCodec> ReportChannel<TabernaRequest<Codec>> for TabernaExpiryReport<Codec>
+impl<Codec: MessageCodec> TabernaTermination<Codec> for ExpireTabernaRequest
 where
     Codec::AppMessage: Send + Sync + 'static,
 {
-    fn send(&self, item: TabernaRequest<Codec>) -> Result<(), TabernaRequest<Codec>> {
+    fn terminate(item: TabernaRequest<Codec>) {
         item.expire();
-        Ok(())
     }
 }
 
-pub(crate) struct TabernaShutdownReport<Codec: MessageCodec>
+impl<Codec: MessageCodec> TabernaTermination<Codec> for ShutdownTabernaRequest
 where
     Codec::AppMessage: Send + Sync + 'static,
 {
-    _marker: PhantomData<Codec>,
+    fn terminate(item: TabernaRequest<Codec>) {
+        item.shutdown();
+    }
 }
 
-impl<Codec: MessageCodec> TabernaShutdownReport<Codec>
+pub(crate) struct TabernaTerminationReport<Codec, F>
 where
+    Codec: MessageCodec,
     Codec::AppMessage: Send + Sync + 'static,
+    F: TabernaTermination<Codec> + Send + Sync + 'static,
+{
+    _marker: PhantomData<(Codec, F)>,
+}
+
+impl<Codec, F> TabernaTerminationReport<Codec, F>
+where
+    Codec: MessageCodec,
+    Codec::AppMessage: Send + Sync + 'static,
+    F: TabernaTermination<Codec> + Send + Sync + 'static,
 {
     pub(crate) fn new() -> Self {
         Self {
@@ -400,15 +485,21 @@ where
     }
 }
 
-impl<Codec: MessageCodec> ReportChannel<TabernaRequest<Codec>> for TabernaShutdownReport<Codec>
+impl<Codec, F> ReportChannel<TabernaRequest<Codec>> for TabernaTerminationReport<Codec, F>
 where
+    Codec: MessageCodec,
     Codec::AppMessage: Send + Sync + 'static,
+    F: TabernaTermination<Codec> + Send + Sync + 'static,
 {
     fn send(&self, item: TabernaRequest<Codec>) -> Result<(), TabernaRequest<Codec>> {
-        item.shutdown();
+        F::terminate(item);
         Ok(())
     }
 }
+
+pub(crate) type TabernaExpiryReport<Codec> = TabernaTerminationReport<Codec, ExpireTabernaRequest>;
+pub(crate) type TabernaShutdownReport<Codec> =
+    TabernaTerminationReport<Codec, ShutdownTabernaRequest>;
 
 fn duration_to_nanos(duration: Duration) -> u64 {
     duration

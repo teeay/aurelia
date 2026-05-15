@@ -24,9 +24,9 @@ impl PreAuthGate {
         let next = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
         if next > limit {
             let registry = config.limited_registry();
-            aurelia_logging::error_limited!(
+            aurelia_logging::warn_limited!(
                 registry,
-                aurelia_logging::limited::log_ids::HANDSHAKE_TOTAL_LIMIT,
+                aurelia_ids::LogId::HandshakeTotalLimit,
                 inflight = next,
                 limit,
                 "pre-auth handshake limit reached; closing inbound connection"
@@ -45,29 +45,5 @@ pub(super) struct PreAuthPermit<'a> {
 impl Drop for PreAuthPermit<'_> {
     fn drop(&mut self) {
         self.gate.inflight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::DomusConfig;
-
-    #[tokio::test]
-    async fn preauth_gate_enforces_limit() {
-        let config = DomusConfig {
-            inbound_handshake_limit_total: 1,
-            ..Default::default()
-        };
-        let access = DomusConfigAccess::from_config(config);
-        let gate = PreAuthGate::new();
-
-        let first = gate.try_acquire(&access).await;
-        assert!(first.is_some());
-        let second = gate.try_acquire(&access).await;
-        assert!(second.is_none());
-        drop(first);
-        let third = gate.try_acquire(&access).await;
-        assert!(third.is_some());
     }
 }

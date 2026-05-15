@@ -4,7 +4,7 @@
 
 [package]
 name = "aurelia"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,5 +21,15 @@ categories = ["network-programming", "asynchronous"]
 path = "src/lib.rs"
 
 [dependencies]
+aurelia-data = { path = "../crates/data" }
+aurelia-ids = { path = "../crates/ids" }
+aurelia-platform = { path = "../crates/platform" }
 aurelia-peering = { path = "../crates/peering" }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+aurelia-resolver = { path = "../crates/resolver" }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+actix.workspace = true
+
+[features]
+actix = ["aurelia-peering/actix"]

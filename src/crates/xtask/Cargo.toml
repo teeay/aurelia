@@ -16,12 +16,12 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-regex = "1"
-walkdir = "2"
-toml_edit = "0.22"
-cargo_metadata = "0.18"
-fs-err = "3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+regex.workspace = true
+walkdir.workspace = true
+toml_edit.workspace = true
+cargo_metadata.workspace = true
+fs-err.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

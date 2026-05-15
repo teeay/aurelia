@@ -6,9 +6,15 @@ use super::super::backend::AuthenticatedStream;
 use super::super::handshake::establish_outbound_primary;
 use super::*;
 use crate::config::DomusConfigBuilder;
+use crate::transport::handshake::{
+    negotiate_blob_settings, validate_backend_identity, validate_blob_hello_request,
+    validate_blob_hello_response,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+const HANDSHAKE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct DialBackend {
@@ -54,21 +60,35 @@ impl TransportBackend for DialBackend {
     }
 }
 
+fn session_and_blob(config: DomusConfigAccess) -> (Arc<PeerSession>, Arc<BlobManager>) {
+    let allocator = Arc::new(PeerMessageIdAllocator::default());
+    let session = Arc::new(PeerSession::new(
+        Arc::clone(&allocator),
+        config.clone(),
+        tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+    ));
+    let blob = Arc::new(BlobManager::new(
+        Arc::new(BlobBufferTracker::default()),
+        Arc::new(Notify::new()),
+        allocator,
+        128,
+    ));
+    (session, blob)
+}
+
 #[test]
 fn blob_hello_request_requires_values() {
-    let hello = HelloPayload {
-        chunk_size: None,
-        ack_window_chunks: None,
-    };
+    let hello = HelloPayload::Primary;
     let err = validate_blob_hello_request(&hello).expect_err("expected error");
     assert_eq!(err.kind, ErrorId::ProtocolViolation);
 }
 
 #[test]
 fn blob_hello_request_rejects_zero_values() {
-    let hello = HelloPayload {
-        chunk_size: Some(0),
-        ack_window_chunks: Some(10),
+    let hello = HelloPayload::Blob {
+        chunk_size: 0,
+        ack_window_chunks: 10,
     };
     let err = validate_blob_hello_request(&hello).expect_err("expected error");
     assert_eq!(err.kind, ErrorId::ProtocolViolation);
@@ -76,19 +96,16 @@ fn blob_hello_request_rejects_zero_values() {
 
 #[test]
 fn blob_hello_response_requires_values() {
-    let hello = HelloPayload {
-        chunk_size: None,
-        ack_window_chunks: None,
-    };
+    let hello = HelloPayload::Primary;
     let err = validate_blob_hello_response(10, 10, &hello).expect_err("expected error");
     assert_eq!(err.kind, ErrorId::ProtocolViolation);
 }
 
 #[test]
 fn blob_hello_response_rejects_excessive_values() {
-    let hello = HelloPayload {
-        chunk_size: Some(20),
-        ack_window_chunks: Some(10),
+    let hello = HelloPayload::Blob {
+        chunk_size: 20,
+        ack_window_chunks: 10,
     };
     let err = validate_blob_hello_response(10, 10, &hello).expect_err("expected error");
     assert_eq!(err.kind, ErrorId::ProtocolViolation);
@@ -96,9 +113,9 @@ fn blob_hello_response_rejects_excessive_values() {
 
 #[test]
 fn blob_hello_response_accepts_valid_values() {
-    let hello = HelloPayload {
-        chunk_size: Some(10),
-        ack_window_chunks: Some(5),
+    let hello = HelloPayload::Blob {
+        chunk_size: 10,
+        ack_window_chunks: 5,
     };
     let settings = validate_blob_hello_response(10, 10, &hello).expect("valid response");
     assert_eq!(settings.chunk_size, 10);
@@ -131,6 +148,7 @@ async fn reconnect_no_resume_returns_fresh_session_on_same_handle() {
     let registry = Arc::new(TabernaRegistry::new());
     let config = DomusConfigBuilder::new()
         .send_timeout(Duration::from_millis(200))
+        .callis_connect_timeout(Duration::from_millis(200))
         .accept_timeout(Duration::from_millis(200))
         .listener_delay(Duration::from_millis(0))
         .build()
@@ -158,7 +176,13 @@ async fn reconnect_no_resume_returns_fresh_session_on_same_handle() {
 
     let (_message, waiter) = handle
         .session
-        .create_outgoing(1, 2, 0x0001_0000, 0, Bytes::from_static(b"pending"))
+        .create_outgoing(
+            1,
+            2,
+            crate::a3_message_type(0),
+            0,
+            Bytes::from_static(b"pending"),
+        )
         .await
         .expect("enqueue");
 
@@ -173,10 +197,7 @@ async fn reconnect_no_resume_returns_fresh_session_on_same_handle() {
         let flags = WireFlags::from_bits(header.flags).expect("flags");
         assert!(flags.contains(WireFlags::RECONNECT));
         let _hello = HelloPayload::from_bytes(&payload).expect("hello payload");
-        let response = HelloPayload {
-            chunk_size: None,
-            ack_window_chunks: None,
-        };
+        let response = HelloPayload::Primary;
         // No RECONNECT echo — receiver's session is gone.
         send_control_frame(
             &mut server,
@@ -221,176 +242,537 @@ async fn reconnect_no_resume_returns_fresh_session_on_same_handle() {
 }
 
 #[tokio::test]
-async fn inbound_primary_rejects_blob_settings_in_hello() {
+async fn outbound_primary_hello_response_uses_callis_connect_deadline() {
     let registry = Arc::new(TabernaRegistry::new());
-    let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
-    let allocator = Arc::new(PeerMessageIdAllocator::default());
-    let session = Arc::new(PeerSession::new(
-        Arc::clone(&allocator),
-        config.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let blob = Arc::new(BlobManager::new(
-        Arc::new(BlobBufferTracker::default()),
-        Arc::new(Notify::new()),
-        Arc::clone(&allocator),
-    ));
-    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
-    let (stream, _peer) = tokio::io::duplex(64);
+    let config = DomusConfigBuilder::new()
+        .send_timeout(Duration::from_secs(1))
+        .accept_timeout(Duration::from_secs(1))
+        .callis_connect_timeout(Duration::from_millis(50))
+        .build()
+        .expect("config");
+    let config = DomusConfigAccess::from_config(config);
+    let (session, blob) = session_and_blob(config.clone());
     let primary_dispatch = session.primary_dispatch();
-    let hello = HelloPayload {
-        chunk_size: Some(4),
-        ack_window_chunks: Some(4),
-    };
-    let err = match super::super::handshake::accept_inbound_primary(
-        config.clone(),
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+    let primary_active = Arc::new(AtomicBool::new(false));
+    let callis_tracker = CallisTracker::new();
+    let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+    let (client, _held_open_peer) = tokio::io::duplex(256);
+
+    let started = Instant::now();
+    let result = establish_outbound_primary(
+        config,
         session,
         blob,
         registry,
-        Arc::new(Notify::new()),
-        primary_dispatch,
-        stream,
+        client,
         events_tx,
-        hello,
-        1,
-        WireFlags::empty(),
-        CallisTracker::new(),
+        primary_active,
+        primary_dispatch,
+        callis_tracker,
+        task_set.spawner(),
+        started + Duration::from_millis(50),
     )
-    .await
-    {
-        Ok(_) => panic!("expected invalid hello"),
+    .await;
+    let err = match result {
+        Ok(_) => panic!("expected primary hello-response timeout"),
         Err(err) => err,
     };
-    assert_eq!(err.kind, ErrorId::ProtocolViolation);
+    assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    assert_eq!(err.message.as_deref(), Some("callis connect timeout"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "callis-connect deadline should fail before the outer send budget"
+    );
+}
+
+#[tokio::test]
+async fn outbound_primary_reconnect_hello_response_uses_callis_connect_deadline() {
+    let registry = Arc::new(TabernaRegistry::new());
+    let config = DomusConfigBuilder::new()
+        .send_timeout(Duration::from_secs(1))
+        .accept_timeout(Duration::from_secs(1))
+        .callis_connect_timeout(Duration::from_millis(50))
+        .build()
+        .expect("config");
+    let config = DomusConfigAccess::from_config(config);
+    let (session, blob) = session_and_blob(config.clone());
+    session.set_active(true);
+    let primary_dispatch = session.primary_dispatch();
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+    let primary_active = Arc::new(AtomicBool::new(false));
+    let callis_tracker = CallisTracker::new();
+    let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+    let (client, _held_open_peer) = tokio::io::duplex(256);
+
+    let started = Instant::now();
+    let result = establish_outbound_primary(
+        config,
+        session,
+        blob,
+        registry,
+        client,
+        events_tx,
+        primary_active,
+        primary_dispatch,
+        callis_tracker,
+        task_set.spawner(),
+        started + Duration::from_millis(50),
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("expected reconnect primary hello-response timeout"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    assert_eq!(err.message.as_deref(), Some("callis connect timeout"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "callis-connect deadline should fail before the outer send budget"
+    );
+}
+
+#[tokio::test]
+async fn outbound_blob_hello_response_uses_callis_connect_deadline() {
+    let registry = Arc::new(TabernaRegistry::new());
+    let config = DomusConfigBuilder::new()
+        .send_timeout(Duration::from_secs(1))
+        .accept_timeout(Duration::from_secs(1))
+        .callis_connect_timeout(Duration::from_millis(50))
+        .build()
+        .expect("config");
+    let config = DomusConfigAccess::from_config(config);
+    let (session, blob) = session_and_blob(config.clone());
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+    let callis_tracker = CallisTracker::new();
+    let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+    let (client, _held_open_peer) = tokio::io::duplex(256);
+
+    let started = Instant::now();
+    let result = super::super::handshake::establish_outbound_blob(
+        config,
+        session,
+        registry,
+        blob,
+        client,
+        events_tx,
+        callis_tracker,
+        task_set.spawner(),
+        started + Duration::from_millis(50),
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("expected blob hello-response timeout"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    assert_eq!(err.message.as_deref(), Some("callis connect timeout"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "callis-connect deadline should fail before the outer send budget"
+    );
+}
+
+#[tokio::test]
+async fn outbound_blob_reconnect_hello_response_uses_callis_connect_deadline() {
+    let registry = Arc::new(TabernaRegistry::new());
+    let config = DomusConfigBuilder::new()
+        .send_timeout(Duration::from_secs(1))
+        .accept_timeout(Duration::from_secs(1))
+        .callis_connect_timeout(Duration::from_millis(50))
+        .build()
+        .expect("config");
+    let config = DomusConfigAccess::from_config(config);
+    let (session, blob) = session_and_blob(config.clone());
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    blob.add_callis(
+        CallisHandle {
+            id: 99,
+            tx: CallisTx::Blob,
+            shutdown: shutdown_tx,
+        },
+        BlobCallisSettings {
+            chunk_size: 1024,
+            ack_window_chunks: 16,
+        },
+        false,
+    )
+    .await;
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+    let callis_tracker = CallisTracker::new();
+    let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+    let (client, _held_open_peer) = tokio::io::duplex(256);
+
+    let started = Instant::now();
+    let result = super::super::handshake::establish_outbound_blob(
+        config,
+        session,
+        registry,
+        blob,
+        client,
+        events_tx,
+        callis_tracker,
+        task_set.spawner(),
+        started + Duration::from_millis(50),
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("expected reconnect blob hello-response timeout"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    assert_eq!(err.message.as_deref(), Some("callis connect timeout"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "callis-connect deadline should fail before the outer send budget"
+    );
+}
+
+#[tokio::test]
+async fn inbound_primary_rejects_blob_settings_in_hello() {
+    tokio::time::timeout(HANDSHAKE_TEST_TIMEOUT, async {
+        let registry = Arc::new(TabernaRegistry::new());
+        let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
+        let allocator = Arc::new(PeerMessageIdAllocator::default());
+        let session = Arc::new(PeerSession::new(
+            Arc::clone(&allocator),
+            config.clone(),
+            tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+        ));
+        let blob = Arc::new(BlobManager::new(
+            Arc::new(BlobBufferTracker::default()),
+            Arc::new(Notify::new()),
+            Arc::clone(&allocator),
+            128,
+        ));
+        let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+        let (stream, _peer) = tokio::io::duplex(64);
+        let primary_dispatch = session.primary_dispatch();
+        let hello = HelloPayload::Blob {
+            chunk_size: 4,
+            ack_window_chunks: 4,
+        };
+        let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+        let err = match super::super::handshake::accept_inbound_primary(
+            config.clone(),
+            session,
+            blob,
+            registry,
+            Arc::new(AtomicBool::new(false)),
+            primary_dispatch,
+            stream,
+            events_tx,
+            hello,
+            1,
+            WireFlags::empty(),
+            CallisTracker::new(),
+            task_set.spawner(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected invalid hello"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, ErrorId::ProtocolViolation);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn inbound_duplicate_primary_does_not_clear_pending_dispatch() {
+    tokio::time::timeout(HANDSHAKE_TEST_TIMEOUT, async {
+        let registry = Arc::new(TabernaRegistry::new());
+        let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
+        let allocator = Arc::new(PeerMessageIdAllocator::default());
+        let session = Arc::new(PeerSession::new(
+            Arc::clone(&allocator),
+            config.clone(),
+            tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+        ));
+        let blob = Arc::new(BlobManager::new(
+            Arc::new(BlobBufferTracker::default()),
+            Arc::new(Notify::new()),
+            Arc::clone(&allocator),
+            128,
+        ));
+        let primary_dispatch = session.primary_dispatch();
+        session.set_active(true);
+        let (message, waiter) = session
+            .create_outgoing(
+                1,
+                2,
+                crate::a3_message_type(1),
+                0,
+                Bytes::from_static(b"pending"),
+            )
+            .await
+            .expect("create outgoing");
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+        let hello = HelloPayload::Primary;
+        let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+        let info = super::super::handshake::accept_inbound_primary(
+            config,
+            Arc::clone(&session),
+            blob,
+            registry,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&primary_dispatch),
+            reader,
+            events_tx,
+            hello,
+            1,
+            WireFlags::empty(),
+            CallisTracker::new(),
+            task_set.spawner(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("accept duplicate primary");
+
+        let (header, _payload) = read_frame(&mut writer, 1024)
+            .await
+            .expect("read hello response")
+            .expect("hello response");
+        assert_eq!(header.msg_type, MSG_HELLO_RESPONSE);
+        assert!(!WireFlags::from_bits(header.flags)
+            .expect("flags")
+            .contains(WireFlags::RECONNECT));
+        assert!(
+            primary_dispatch
+                .message(message.peer_msg_id)
+                .await
+                .is_some(),
+            "duplicate inbound primary must not clear pending dispatch"
+        );
+
+        let _ = info.handle.shutdown.send(true);
+        session.handle_ack(message.peer_msg_id).await;
+        let _ = waiter;
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn inbound_duplicate_primary_during_activation_does_not_clear_pending_dispatch() {
+    tokio::time::timeout(HANDSHAKE_TEST_TIMEOUT, async {
+        let registry = Arc::new(TabernaRegistry::new());
+        let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
+        let allocator = Arc::new(PeerMessageIdAllocator::default());
+        let session = Arc::new(PeerSession::new(
+            Arc::clone(&allocator),
+            config.clone(),
+            tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+        ));
+        let blob = Arc::new(BlobManager::new(
+            Arc::new(BlobBufferTracker::default()),
+            Arc::new(Notify::new()),
+            Arc::clone(&allocator),
+            128,
+        ));
+        let primary_dispatch = session.primary_dispatch();
+        session.set_active(true);
+        let (message, waiter) = session
+            .create_outgoing(
+                1,
+                2,
+                crate::a3_message_type(2),
+                0,
+                Bytes::from_static(b"pending"),
+            )
+            .await
+            .expect("create outgoing");
+
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+        let hello = HelloPayload::Primary;
+        let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+        let info = super::super::handshake::accept_inbound_primary(
+            config,
+            Arc::clone(&session),
+            blob,
+            registry,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&primary_dispatch),
+            reader,
+            events_tx,
+            hello,
+            1,
+            WireFlags::empty(),
+            CallisTracker::new(),
+            task_set.spawner(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("accept duplicate primary during activation");
+
+        let (header, _payload) = read_frame(&mut writer, 1024)
+            .await
+            .expect("read hello response")
+            .expect("hello response");
+        assert_eq!(header.msg_type, MSG_HELLO_RESPONSE);
+        assert!(!WireFlags::from_bits(header.flags)
+            .expect("flags")
+            .contains(WireFlags::RECONNECT));
+        assert!(
+            primary_dispatch
+                .message(message.peer_msg_id)
+                .await
+                .is_some(),
+            "duplicate inbound primary during activation must not clear pending dispatch"
+        );
+
+        let _ = info.handle.shutdown.send(true);
+        session.handle_ack(message.peer_msg_id).await;
+        let _ = waiter;
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn inbound_hello_rejects_unknown_flags() {
-    let registry = Arc::new(TabernaRegistry::new());
-    let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
-    let allocator = Arc::new(PeerMessageIdAllocator::default());
-    let session = Arc::new(PeerSession::new(
-        Arc::clone(&allocator),
-        config.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let blob = Arc::new(BlobManager::new(
-        Arc::new(BlobBufferTracker::default()),
-        Arc::new(Notify::new()),
-        Arc::clone(&allocator),
-    ));
-    let primary_active = Arc::new(AtomicBool::new(false));
-    let primary_available = Arc::new(Notify::new());
-    let primary_dispatch = session.primary_dispatch();
-    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
-    let (mut writer, reader) = tokio::io::duplex(64);
-    let header = WireHeader {
-        version: PROTOCOL_VERSION,
-        flags: 0x8000,
-        msg_type: MSG_HELLO,
-        peer_msg_id: 1,
-        src_taberna: 0,
-        dst_taberna: 0,
-        payload_len: 0,
-    };
-    writer
-        .write_all(&header.encode())
-        .await
-        .expect("write header");
+    tokio::time::timeout(HANDSHAKE_TEST_TIMEOUT, async {
+        let registry = Arc::new(TabernaRegistry::new());
+        let config: DomusConfigAccess = DomusConfigAccess::from_config(DomusConfig::default());
+        let allocator = Arc::new(PeerMessageIdAllocator::default());
+        let session = Arc::new(PeerSession::new(
+            Arc::clone(&allocator),
+            config.clone(),
+            tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+        ));
+        let blob = Arc::new(BlobManager::new(
+            Arc::new(BlobBufferTracker::default()),
+            Arc::new(Notify::new()),
+            Arc::clone(&allocator),
+            128,
+        ));
+        let primary_active = Arc::new(AtomicBool::new(false));
+        let primary_dispatch = session.primary_dispatch();
+        let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let header = WireHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0x8000,
+            msg_type: MSG_HELLO,
+            peer_msg_id: 1,
+            src_taberna: 0,
+            dst_taberna: 0,
+            payload_len: 0,
+        };
+        writer
+            .write_all(&header.encode())
+            .await
+            .expect("write header");
 
-    let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
-    let err = match super::super::handshake::accept_inbound(
-        config,
-        session,
-        blob,
-        registry,
-        primary_active,
-        primary_available,
-        primary_dispatch,
-        reader,
-        events_tx,
-        CallisTracker::new(),
-        listener_shutdown_rx,
-    )
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+        let err = match super::super::handshake::accept_inbound(
+            config,
+            session,
+            blob,
+            registry,
+            primary_active,
+            primary_dispatch,
+            reader,
+            events_tx,
+            CallisTracker::new(),
+            listener_shutdown_rx,
+            task_set.spawner(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected invalid flags"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, ErrorId::ProtocolViolation);
+    })
     .await
-    {
-        Ok(_) => panic!("expected invalid flags"),
-        Err(err) => err,
-    };
-    assert_eq!(err.kind, ErrorId::ProtocolViolation);
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn inbound_rejects_when_parallel_callis_limit_reached() {
-    let registry = Arc::new(TabernaRegistry::new());
-    let cfg = DomusConfig {
-        max_parallel_callis_per_peer: 1,
-        ..Default::default()
-    };
-    let config: DomusConfigAccess = DomusConfigAccess::from_config(cfg);
-    let allocator = Arc::new(PeerMessageIdAllocator::default());
-    let session = Arc::new(PeerSession::new(
-        Arc::clone(&allocator),
-        config.clone(),
-        tokio::runtime::Handle::current(),
-    ));
-    let blob = Arc::new(BlobManager::new(
-        Arc::new(BlobBufferTracker::default()),
-        Arc::new(Notify::new()),
-        Arc::clone(&allocator),
-    ));
-    let primary_active = Arc::new(AtomicBool::new(false));
-    let primary_available = Arc::new(Notify::new());
-    let primary_dispatch = session.primary_dispatch();
-    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
-    let (mut writer, reader) = tokio::io::duplex(256);
+    tokio::time::timeout(HANDSHAKE_TEST_TIMEOUT, async {
+        let registry = Arc::new(TabernaRegistry::new());
+        let cfg = DomusConfig {
+            max_parallel_callis_per_peer: 1,
+            ..Default::default()
+        };
+        let config: DomusConfigAccess = DomusConfigAccess::from_config(cfg);
+        let allocator = Arc::new(PeerMessageIdAllocator::default());
+        let session = Arc::new(PeerSession::new(
+            Arc::clone(&allocator),
+            config.clone(),
+            tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+        ));
+        let blob = Arc::new(BlobManager::new(
+            Arc::new(BlobBufferTracker::default()),
+            Arc::new(Notify::new()),
+            Arc::clone(&allocator),
+            128,
+        ));
+        let primary_active = Arc::new(AtomicBool::new(false));
+        let primary_dispatch = session.primary_dispatch();
+        let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(1);
+        let (mut writer, reader) = tokio::io::duplex(256);
 
-    let hello = HelloPayload {
-        chunk_size: None,
-        ack_window_chunks: None,
-    };
-    let payload = hello.to_bytes();
-    let header = WireHeader {
-        version: PROTOCOL_VERSION,
-        flags: WireFlags::empty().bits(),
-        msg_type: MSG_HELLO,
-        peer_msg_id: 1,
-        src_taberna: 0,
-        dst_taberna: 0,
-        payload_len: payload.len() as u32,
-    };
-    writer
-        .write_all(&header.encode())
+        let hello = HelloPayload::Primary;
+        let payload = hello.to_bytes();
+        let header = WireHeader {
+            version: PROTOCOL_VERSION,
+            flags: WireFlags::empty().bits(),
+            msg_type: MSG_HELLO,
+            peer_msg_id: 1,
+            src_taberna: 0,
+            dst_taberna: 0,
+            payload_len: payload.len() as u32,
+        };
+        writer
+            .write_all(&header.encode())
+            .await
+            .expect("write header");
+        writer
+            .write_all(payload.as_slice())
+            .await
+            .expect("write payload");
+
+        let callis_tracker = CallisTracker::new();
+        callis_tracker.open();
+
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let task_set = PeerTaskSet::new(&tokio::runtime::Handle::current());
+        let err = match super::super::handshake::accept_inbound(
+            config,
+            session,
+            blob,
+            registry,
+            primary_active,
+            primary_dispatch,
+            reader,
+            events_tx,
+            callis_tracker,
+            listener_shutdown_rx,
+            task_set.spawner(),
+        )
         .await
-        .expect("write header");
-    writer
-        .write_all(payload.as_slice())
-        .await
-        .expect("write payload");
-
-    let callis_tracker = CallisTracker::new();
-    callis_tracker.open();
-
-    let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
-    let err = match super::super::handshake::accept_inbound(
-        config,
-        session,
-        blob,
-        registry,
-        primary_active,
-        primary_available,
-        primary_dispatch,
-        reader,
-        events_tx,
-        callis_tracker,
-        listener_shutdown_rx,
-    )
+        {
+            Ok(_) => panic!("expected callis limit rejection"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    })
     .await
-    {
-        Ok(_) => panic!("expected callis limit rejection"),
-        Err(err) => err,
-    };
-    assert_eq!(err.kind, ErrorId::PeerUnavailable);
+    .expect("async test timed out");
 }
 
 // Reference unused symbol so the helper stays in scope for future expansion.

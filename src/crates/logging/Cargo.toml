@@ -16,6 +16,6 @@ description = "Aurelia logging utilities."
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["sync"] }
-tracing = "0.1"
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 aurelia-ids = { path = "../ids" }

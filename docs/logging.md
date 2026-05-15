@@ -10,6 +10,15 @@ Status: Developed
 
 ## Technical Details
 
+### Logging Levels
+
+- `info`: Operational milestones that establish progress or state (for example, connection
+  established or handshake completed).
+- `warn`: Errors that are handled without jeopardizing system functionality.
+- `error`: Errors that jeopardize system functionality or require operator attention.
+- `debug`: Major internal activities within a function that explain control flow and decisions.
+- `trace`: All significant steps that are worth logging for deep troubleshooting.
+
 ### Limited Logging Registry
 
 - Each Domus owns its own registry of `LogId` (`u32`) entries and last-log timestamps.
@@ -23,6 +32,11 @@ Status: Developed
 - A `watch::Sender<u64>` carries the suppression interval in seconds.
 - Updates call `LimitedLogControl::set_interval(Duration)`.
 - Call sites read the interval synchronously through `watch::Receiver::borrow()`.
+- Limited logging intentionally operates at whole-second resolution. `Duration::as_secs()` is the
+  conversion boundary, so any sub-second component is truncated before storage.
+- `Duration::ZERO` disables limited logging. Any non-zero interval shorter than one second also
+  truncates to zero and therefore disables limited logging.
+- Sub-second precision is not supported for limited logging intervals.
 
 ### Macros
 
@@ -43,7 +57,8 @@ Each macro emits `log_id = <id>` in structured output and only logs when the reg
 
 - Domus startup creates a per-Domus limited logging context with all known IDs and the configured interval.
 - Config updates call `LimitedLogControl::set_interval` on the Domus-local control handle.
-- The interval is configured via `DomusConfig::limited_log_interval` and may be updated through `DomusConfigAccess`.
+- The interval is configured via `DomusConfig::limited_log_interval` and may be updated through
+  `DomusConfigAccess`. Operators should configure this value in whole seconds.
 
 ### Testing Scope
 

@@ -5,26 +5,72 @@ Status: Developed
 ## Objectives
 
 - Provide a UNIX socket transport backend that is transparent to A1 once authenticated.
-- Perform peer authentication in A0 (below A1) with a dedicated socket auth handshake (no A1 wire protocol changes).
+- Perform certificate-backed authentication in A0 (below A1) with a dedicated socket auth
+  handshake (no A1 wire protocol changes).
 - Preserve domus identity semantics using canonicalized socket paths and certificate SANs.
 
 ## Technical Details
+
+### Per-Callis A0 Authentication
+
+Every socket callis uses the full connect-back authentication handshake before A1 `hello`.
+
+The socket A0 message set must be:
+
+```text
+1: AUTH_INIT
+2: AUTH_CHALLENGE
+3: AUTH_PROOF
+4: CALLBACK_INIT
+```
+
+This includes the first primary callis, any second or third primary callis opened by tests, and
+all blob callis. The backend must validate canonical origin/destination paths, certificate chain,
+URI SAN, callback nonce echo, challenge signature, and proof signature for each callis
+independently.
+
+Any message type outside this set has no compatibility meaning. If an unexpected message type
+appears as the first A0 message on an inbound socket, the backend rejects it as
+`ProtocolViolation`.
+
+Tests open repeated socket callis through real backend `dial()` and `accept()` calls. They prove
+first, second, and third callis all complete full connect-back and return
+`DomusAddr::Socket(origin_path)`. Existing callback-before-wait, callback-after-wait, callback
+timeout, nonce/path/certificate mismatch, stale callback, simultaneous connect-back, and smooth
+auth rotation coverage remains valid.
 
 ### Transport Backend Boundary
 
 The peering transport depends on a backend that yields authenticated, bidirectional streams. The backend is responsible for binding, accepting, dialing, and validating peer identity. A1 only sees a stream plus the authenticated domus address.
 
+The socket backend contributes the socket variant to the production backend and stream enums
+defined in `docs/peering/transport-model.md`. Its authenticated stream type is `UnixStream`, and
+A1 callis logic receives it through the `TransportBackend::Stream` associated type.
+
 The socket transport is intended for communication between modules within the same process or
 within the same host trust boundary. Socket paths are expected to be protected by filesystem
-permissions so untrusted writers cannot create or replace the socket file. The peering layer does
-not attempt to manage concurrent process lifecycles; if a socket path is replaced between removal
-and bind, the bind fails and the caller must handle the startup error.
+permissions so untrusted writers cannot create or replace the socket file. Identity is still
+validated with PKCS#8 certificate material and socket-path URI SANs. The peering layer does not
+attempt to manage concurrent process lifecycles; if a socket path is replaced between removal and
+bind, the bind fails and the caller must handle the startup error.
 
 A0 connection limits for inbound callis are defined in `docs/peering/connection-limits.md` and are enforced before any A1 `hello`.
 
 Inbound sockets are counted as in-flight handshakes from accept until the socket auth handshake
 completes, fails, or times out. If the global A0 limit is reached, the socket is closed immediately
 before any auth frames are read.
+
+`SocketBackend::accept` must keep accepting raw Unix sockets while earlier sockets are still in
+A0 authentication. Each accepted socket is handed to an authentication task spawned through the
+Aurelia runtime handle. The task owns the pre-authentication permit, applies
+`socket_handshake_timeout` to the full A0 path, and sends authenticated streams or errors back to
+the backend accept queue. Callback-channel messages that complete socket rendezvous state do not
+return from the backend `accept` call.
+
+Socket A0 authentication tasks are detached from a single `accept()` await. If an `accept()` caller
+is cancelled after raw sockets have been accepted, already spawned authentication tasks continue
+until success, failure, timeout, or backend drop. The backend accept queue capacity is the maximum
+validated `inbound_handshake_limit_total`.
 
 ```rust
 #[async_trait::async_trait]
@@ -43,13 +89,16 @@ pub trait TransportBackend: Send + Sync {
 
 The shared A1 transport logic uses `Stream` only; no transport-specific types leak upward.
 
-Each Aurelia instance derives a single transport backend from the local `DomusAddr` used to create it.
+Each Aurelia instance derives a single transport backend from the shared `aurelia-data` `DomusAddr`
+used to create it.
 Backend selection happens once at instantiation and is immutable for the lifetime of the Domus. When the
 local address is `DomusAddr::Socket`, all resolver output must be `DomusAddr::Socket`, and any TCP
 address is rejected.
 
-Auth material is supplied via `DomusAuthConfig::Pkcs8` (DER or PEM). PEM inputs are parsed into DER internally
-before use using `rustls-pki-types`; the on-wire socket auth handshake always transmits DER certificate bytes.
+Auth material is supplied via `Pkcs8AuthConfig` (DER or PEM). PEM inputs are parsed into DER
+internally before use using `rustls-pki-types`; the on-wire socket auth handshake transmits DER
+certificate chains. DER config supplies a one-certificate chain. PEM config preserves every
+certificate parsed from `cert_pem` in chain order.
 
 ### Domus Address
 
@@ -62,17 +111,16 @@ pub enum DomusAddr {
 }
 ```
 
-The backend must return the authenticated `DomusAddr`. The resolver, peer maps, and dispatch surfaces use the same type.
+The backend must return the authenticated `DomusAddr`. The resolver, peer maps, and dispatch
+surfaces use the same shared data type.
 
 ### Socket Authentication Handshake (A0, Connect-Back)
 
 Socket authentication occurs before any A1 `hello` frames. It is a dedicated, length-prefixed handshake that validates
 peer identity and returns a verified `DomusAddr::Socket`.
 
-The connect-back handshake is required for the first primary callis to a peer (when no live peer
-session exists). Additional primary callis and blob callis on a live peer session use the
-simplified `AUTH_RESUME` handshake described below; resume does not bypass certificate validation
-and does not require any per-peer pin.
+The connect-back handshake is required for every socket callis. This includes the first primary
+callis, additional primary callis opened by tests, and blob callis.
 
 There are two channels during connect-back:
 
@@ -106,7 +154,6 @@ Where `version = 1` and:
 - `2`: `AUTH_CHALLENGE`
 - `3`: `AUTH_PROOF`
 - `4`: `CALLBACK_INIT`
-- `5`: `AUTH_RESUME`
 
 In every message, `origin_path` is the sender’s canonical socket path and `destination_path` is the receiver’s canonical
 socket path.
@@ -115,7 +162,6 @@ Bounds:
 
 - `origin_path_len` and `destination_path_len` must be `> 0` and `<= PATH_MAX` for the host OS.
 - `nonce_len`, `callback_nonce_len`, and `echo_nonce_len` must be exactly 32 bytes.
-- `session_nonce_len` must be exactly 128 bytes.
 
 #### AUTH_INIT (initiator -> receiver, primary channel)
 
@@ -124,12 +170,14 @@ u8 msg_type = 1
 u8 version = 1
 u16 origin_path_len
 u16 destination_path_len
-u32 cert_len
+u16 cert_count
+repeated cert_count times:
+  u32 cert_len
 u16 nonce_len
 u16 callback_nonce_len
 origin_path bytes (UTF-8)
 destination_path bytes (UTF-8)
-cert bytes (DER)
+cert bytes (DER), in chain order
 nonce_a bytes
 nonce_a_cb bytes
 ```
@@ -137,7 +185,8 @@ nonce_a_cb bytes
 Validation:
 
 - `origin_path` and `destination_path` must be absolute, canonicalized paths.
-- The receiver must verify the certificate chain against the configured CA and ensure the URI SAN is
+- The receiver must verify the leaf certificate against the configured CA using the remaining
+  presented certificates as intermediates and ensure the leaf URI SAN is
   `aurelia+unix://<origin_path>`.
 - `destination_path` must match the receiver’s local socket path.
 
@@ -177,12 +226,14 @@ u8 msg_type = 2
 u8 version = 1
 u16 origin_path_len
 u16 destination_path_len
-u32 cert_len
+u16 cert_count
+repeated cert_count times:
+  u32 cert_len
 u16 nonce_len
 u32 signature_len
 origin_path bytes (UTF-8)
 destination_path bytes (UTF-8)
-cert bytes (DER)
+cert bytes (DER), in chain order
 nonce_b bytes
 signature bytes
 ```
@@ -195,8 +246,8 @@ nonce_a || nonce_b || u16(origin_path_len) || u16(destination_path_len) || origi
 
 Validation:
 
-- Initiator verifies receiver cert chain and URI SAN `aurelia+unix://<origin_path>`.
-- Initiator verifies signature using the receiver certificate.
+- Initiator verifies receiver cert chain and URI SAN `aurelia+unix://<origin_path>` on the leaf.
+- Initiator verifies signature using the receiver leaf certificate public key.
 - Initiator must already have received `CALLBACK_INIT` to obtain `nonce_b_cb` for replay on the primary channel.
 
 #### AUTH_PROOF (initiator -> receiver, primary channel)
@@ -216,7 +267,7 @@ The signature is over:
 nonce_b || nonce_a || nonce_b_cb || u16(origin_path_len) || u16(destination_path_len) || origin_path || destination_path
 ```
 
-Receiver verifies signature using the initiator certificate.
+Receiver verifies signature using the initiator leaf certificate public key.
 
 Validation:
 
@@ -240,51 +291,101 @@ The callback connect timeout is configurable as `socket_callback_timeout` with a
 retries; if the callback fails or times out, the primary handshake fails and the connection is closed.
 
 The overall A0 handshake timeout is configurable as `socket_handshake_timeout` with a default of 5 seconds. The
-initiator starts this timer when it sends the first auth frame (`AUTH_INIT` for connect-back, `AUTH_RESUME` for resume).
-The receiver starts its timer when it receives the first auth frame. The handshake must complete within that window on
-both sides or the connection is closed.
+initiator starts this timer when the backend begins socket connect for the callis. The receiver starts this timer
+immediately after accepting the socket and acquiring the inbound pre-authentication permit. The timeout covers the
+first auth-frame read, certificate validation, callback connection, callback validation, challenge/proof validation,
+and proof validation. The handshake must complete within that window on both sides or the connection is closed.
+The A1 `callis_connect_timeout` is the outer callis setup budget and can expire first.
 
-### Resume Handshake
+### Certificate Chains and URI SANs
 
-A1 does not pin per-peer certificates or session nonces. Each callis is admitted on its own A0
-authentication, which is sufficient because the certificate chain validation against the
-configured CA establishes peer identity on every connection. Different valid certificates from the
-same peer path are accepted across callis (smooth rotation).
+Every socket auth message that presents a certificate presents the full configured certificate
+chain in leaf-first order. Verification uses the first certificate as the leaf and passes the
+remaining certificates to WebPKI as intermediates. A missing intermediate in a multi-tier CA
+hierarchy is a `ProtocolViolation`.
 
-#### AUTH_RESUME (initiator -> receiver, additional connections)
+The leaf certificate must contain an Aurelia URI SAN of the form
+`aurelia+unix://<canonical-path>`. Multiple Aurelia URI SAN entries are accepted only when every
+entry canonicalizes to the same path. Conflicting Aurelia URI SAN entries are a
+`ProtocolViolation`.
 
-Additional primary callis (parallel primaries) and all blob callis use a single-step resume
-handshake once the peer session is live.
+Socket proof signatures bind identity through certificate validation and public-key ownership:
+the verifier first validates the certificate chain and URI SAN, then verifies the proof signature
+with the leaf certificate public key. The signed challenge bytes do not include a certificate
+hash.
 
-```text
-u8 msg_type = 5
-u8 version = 1
-u16 origin_path_len
-u16 destination_path_len
-u32 cert_len
-u16 session_nonce_len
-u32 signature_len
-origin_path bytes (UTF-8)
-destination_path bytes (UTF-8)
-cert bytes (DER)
-session_nonce bytes
-signature bytes
-```
+RSA socket proof signatures use RSA-PSS-SHA256. ECDSA P-256 uses ECDSA-P256-SHA256-ASN.1, ECDSA
+P-384 uses ECDSA-P384-SHA384-ASN.1, and Ed25519 uses Ed25519.
 
-The signature is over:
+### Socket Callback Rendezvous State
 
-```text
-session_nonce || u16(origin_path_len) || u16(destination_path_len) || origin_path || destination_path
-```
+The socket backend owns a callback rendezvous map for connect-back validation. This map connects
+the primary channel's `AUTH_INIT`/`AUTH_CHALLENGE` flow to the callback channel's `CALLBACK_INIT`
+flow as a small state machine with latched completion.
 
-Validation:
+Required state transitions:
 
-- The receiver must already have a live peer session for the originating path; otherwise the
-  connection is rejected (full connect-back is required for the first primary callis, and blob
-  callis are not allowed without an active primary).
-- `origin_path` and `destination_path` must be canonicalized and the `destination_path` must match the local socket path.
-- The certificate must verify against the configured CA and present the expected URI SAN.
-- The signature must verify with the provided certificate.
+1. **Pending registered:** the initiator inserts `nonce_a_cb`, expected canonical peer path, and a
+   one-shot reply before it waits for the callback.
+2. **Callback arrived:** the callback accept path validates message type, version, canonical
+   origin/destination paths, `echo_nonce_a_cb`, and peer certificate URI SAN before completing the
+   one-shot reply with `nonce_b_cb`.
+3. **Primary completed:** after the primary channel validates `AUTH_CHALLENGE` and sends
+   `AUTH_PROOF`, the pending entry must already be consumed.
+4. **Failure cleanup:** timeout, nonce mismatch, path mismatch, certificate mismatch, callback
+   channel close, primary channel close, and task cancellation must remove the pending entry
+   exactly once.
+
+Primitive behavior:
+
+- Callback arrival uses a latched primitive such as `oneshot`; it does not depend on a
+  non-latching `Notify` to observe callback arrival.
+- The pending callback map does not hold its lock while performing socket I/O, filesystem
+  canonicalization, certificate validation, callback dial, or waiting for the callback reply.
+- A callback that arrives before the primary task begins awaiting the reply still satisfies the
+  primary task.
+- A callback that arrives after timeout cleanup is rejected and does not recreate state.
+- Smooth auth reload does not mutate or invalidate already registered callback rendezvous entries;
+  each entry validates against the auth material and canonical peer path captured for that
+  handshake.
+
+Testing coverage:
+
+- Unit or backend tests must cover callback-before-wait, callback-after-wait, callback timeout,
+  nonce mismatch cleanup, path mismatch cleanup, certificate mismatch cleanup, simultaneous
+  connect-back, smooth auth reload during callback, and stale callback rejection after timeout.
+- Integration tests must cover socket connect-back success, repeated full-auth callis, removed
+  message type rejection, callback path mismatch, callback timeout, and smooth auth rotation.
+
+### Shared Callback Rendezvous Requirements
+
+Socket may share callback rendezvous lifecycle mechanics with the TCP backend, but socket-specific
+authentication and canonical path validation must remain owned by the socket transport.
+
+The shared mechanics may cover:
+
+- registration of a pending callback entry before the primary task waits;
+- latched completion through a one-shot reply;
+- exactly-once removal on success, timeout, cancellation, channel close, or validation failure;
+- stale callback rejection after timeout cleanup;
+- lock-free waiting, where no rendezvous map lock is held across socket I/O, filesystem
+  canonicalization, certificate validation, callback dial, or waiting for the callback reply.
+
+The shared helper must not own:
+
+- socket certificate URI SAN validation;
+- expected canonical origin and destination path validation;
+- nonce payload parsing or protocol message type/version validation;
+- smooth-auth material selection for an individual handshake.
+
+Testing coverage:
+
+- Socket tests must continue to cover callback-before-wait and callback-after-wait against the
+  shared lifecycle helper.
+- Socket mismatch and timeout tests must prove failed callbacks remove pending state exactly once
+  and do not satisfy a later primary handshake.
+- Smooth auth reload tests must prove an already registered socket callback validates against the
+  handshake-captured material rather than whatever material is current after reload.
 
 ### Canonicalization
 
@@ -304,9 +405,8 @@ The socket backend mirrors TCP:
 
 - Primary and blob callis are separate connections to the same socket path.
 - Callis type is determined by the A1 `hello` flags (specifically `BLOB`).
-- The connect-back handshake is required for the first primary callis to a peer (when no live
-  peer session exists).
-- Additional primary callis and blob callis on a live peer session use `AUTH_RESUME`.
+- The connect-back handshake is required for every primary and blob callis.
+- Additional primary callis opened by tests use the same full connect-back handshake.
 
 ### Auth Reload (Smooth Rotation)
 

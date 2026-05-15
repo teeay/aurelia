@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Zivatar Limited
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::address::TransportKind;
 use crate::observability::ObservabilityHandle;
+use aurelia_data::TransportKind;
 use aurelia_ids::{AureliaError, ErrorId};
 use aurelia_logging::limited;
 
@@ -18,7 +19,6 @@ pub(crate) const DEFAULT_SOCKET_BLOB_CHUNK_SIZE: u32 = 128 * 1024;
 pub(crate) const DEFAULT_SOCKET_BLOB_ACK_WINDOW: u32 = 32;
 
 pub(crate) const MAX_SEND_QUEUE_SIZE: usize = 4096;
-pub(crate) const MAX_INFLIGHT_WINDOW: usize = 1024;
 pub(crate) const MAX_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL: usize = 1024;
 pub(crate) const MAX_INBOUND_HANDSHAKE_LIMIT_PER_PEER: usize = 64;
@@ -28,6 +28,7 @@ pub(crate) const MAX_BLOB_ACK_WINDOW: u32 = 4096;
 pub(crate) const MAX_BLOB_BUFFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(crate) const MAX_RECONNECT_BACKOFF_STEPS: usize = 16;
 pub(crate) const MAX_SEND_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const MAX_CALLIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const MAX_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(300);
 pub(crate) const MAX_LISTENER_DELAY: Duration = Duration::from_secs(60);
@@ -52,11 +53,11 @@ pub struct DomusConfig {
     pub send_queue_size: usize,
     /// Total time a send may take before failing with `SendTimeout`.
     pub send_timeout: Duration,
-    /// Number of unacknowledged messages allowed in flight per peer.
-    pub inflight_window: usize,
+    /// Total time a primary/blob callis setup may take before failing.
+    pub callis_connect_timeout: Duration,
     /// Time to wait for a remote taberna to accept an inbound callis.
     pub accept_timeout: Duration,
-    /// Capacity of the inbound queue presented to a [`crate::TabernaInbox`].
+    /// Capacity of the inbound queue presented to an internal taberna inbox.
     pub taberna_accept_queue_size: usize,
     /// Interval between keepalive frames on an idle connection.
     pub keepalive_interval: Duration,
@@ -80,12 +81,10 @@ pub struct DomusConfig {
     pub inbound_handshake_limit_total: usize,
     /// Maximum concurrent inbound handshakes from a single peer.
     pub inbound_handshake_limit_per_peer: usize,
-    /// Maximum concurrent callises a single peer may run.
+    /// Maximum concurrent calles a single peer may run.
     pub max_parallel_callis_per_peer: usize,
-    /// Size of each blob chunk on the wire, in bytes.
-    pub blob_chunk_size: u32,
-    /// Number of unacknowledged blob chunks allowed in flight.
-    pub blob_ack_window: u32,
+    /// Blob chunk size and acknowledgment window, configured as one transport window.
+    pub blob_window: BlobWindowConfig,
     /// Soft cap on outbound blob buffer memory, in bytes.
     pub blob_outbound_buffer_bytes: u64,
     /// Soft cap on inbound blob buffer memory, in bytes.
@@ -94,12 +93,39 @@ pub struct DomusConfig {
     pub max_payload_len: usize,
 }
 
+/// Blob chunk size and acknowledgment window configured as one pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobWindowConfig {
+    chunk_size: u32,
+    ack_window: u32,
+}
+
+impl BlobWindowConfig {
+    /// Creates a blob window with a chunk size and ACK window.
+    pub const fn new(chunk_size: u32, ack_window: u32) -> Self {
+        Self {
+            chunk_size,
+            ack_window,
+        }
+    }
+
+    /// Size of each blob chunk on the wire, in bytes.
+    pub const fn chunk_size(self) -> u32 {
+        self.chunk_size
+    }
+
+    /// Number of unacknowledged blob chunks allowed in flight.
+    pub const fn ack_window(self) -> u32 {
+        self.ack_window
+    }
+}
+
 impl Default for DomusConfig {
     fn default() -> Self {
         Self {
             send_queue_size: 128,
             send_timeout: Duration::from_secs(30),
-            inflight_window: 16,
+            callis_connect_timeout: Duration::from_secs(15),
             accept_timeout: Duration::from_secs(5),
             taberna_accept_queue_size: 2,
             keepalive_interval: Duration::from_secs(15),
@@ -113,13 +139,15 @@ impl Default for DomusConfig {
             socket_callback_timeout: Duration::from_secs(2),
             socket_handshake_timeout: Duration::from_secs(5),
             tcp_callback_timeout: Duration::from_secs(10),
-            tcp_handshake_timeout: Duration::from_secs(20),
+            tcp_handshake_timeout: Duration::from_secs(10),
             limited_log_interval: Duration::from_secs(120),
             inbound_handshake_limit_total: 64,
             inbound_handshake_limit_per_peer: 3,
             max_parallel_callis_per_peer: 8,
-            blob_chunk_size: DEFAULT_TCP_BLOB_CHUNK_SIZE,
-            blob_ack_window: DEFAULT_TCP_BLOB_ACK_WINDOW,
+            blob_window: BlobWindowConfig::new(
+                DEFAULT_TCP_BLOB_CHUNK_SIZE,
+                DEFAULT_TCP_BLOB_ACK_WINDOW,
+            ),
             blob_outbound_buffer_bytes: 256 * 1024 * 1024,
             blob_inbound_buffer_bytes: 256 * 1024 * 1024,
             max_payload_len: 8 * 1024 * 1024,
@@ -128,22 +156,33 @@ impl Default for DomusConfig {
 }
 
 impl DomusConfig {
-    /// Adjusts blob defaults to match the chosen transport when the caller
-    /// has not customised them; a no-op if any blob field has been set away
-    /// from its TCP default.
-    pub fn apply_transport_defaults(&mut self, transport: TransportKind) {
+    /// Adjusts the blob window defaults to match the chosen transport when the
+    /// caller has not customised the paired blob window.
+    pub(crate) fn apply_transport_defaults(&mut self, transport: TransportKind) {
         if transport == TransportKind::Socket
-            && self.blob_chunk_size == DEFAULT_TCP_BLOB_CHUNK_SIZE
-            && self.blob_ack_window == DEFAULT_TCP_BLOB_ACK_WINDOW
+            && self.blob_window
+                == BlobWindowConfig::new(DEFAULT_TCP_BLOB_CHUNK_SIZE, DEFAULT_TCP_BLOB_ACK_WINDOW)
         {
-            self.blob_chunk_size = DEFAULT_SOCKET_BLOB_CHUNK_SIZE;
-            self.blob_ack_window = DEFAULT_SOCKET_BLOB_ACK_WINDOW;
+            self.blob_window = BlobWindowConfig::new(
+                DEFAULT_SOCKET_BLOB_CHUNK_SIZE,
+                DEFAULT_SOCKET_BLOB_ACK_WINDOW,
+            );
         }
     }
 }
 
+pub(crate) fn normalize_domus_config_for_transport(
+    mut config: DomusConfig,
+    transport: TransportKind,
+) -> Result<DomusConfig, AureliaError> {
+    config.apply_transport_defaults(transport);
+    let (config, clamp) = normalize_domus_config(config, system_memory_bytes())?;
+    log_blob_clamp(&clamp);
+    Ok(config)
+}
+
 #[derive(Clone, Debug)]
-pub struct BlobBufferClamp {
+pub(crate) struct BlobBufferClamp {
     outbound_requested: u64,
     inbound_requested: u64,
     outbound_clamped: bool,
@@ -195,6 +234,76 @@ fn config_relation_error(field: &'static str, message: impl Into<String>) -> Aur
     )
 }
 
+// Convention: per-field validation in `validate_domus_config` should go through one of the
+// `check_*` helpers below rather than open-coding `if value > MAX { return Err(...); }`. New
+// validation patterns should add a helper here when a similar pattern is likely to recur, so the
+// validator stays a flat list of one-liners with cross-field relations as the only inline checks.
+fn check_range(field: &'static str, value: u64, max: u64) -> Result<(), AureliaError> {
+    if value == 0 || value > max {
+        return Err(config_range_error(field, 1, max, value));
+    }
+    Ok(())
+}
+
+fn check_max_u64(field: &'static str, value: u64, max: u64) -> Result<(), AureliaError> {
+    if value > max {
+        return Err(config_max_error(field, max, value));
+    }
+    Ok(())
+}
+
+fn check_max_duration(
+    field: &'static str,
+    value: Duration,
+    max: Duration,
+) -> Result<(), AureliaError> {
+    if value > max {
+        return Err(config_relation_error(field, format!("must be <= {max:?}")));
+    }
+    Ok(())
+}
+
+fn check_range_duration(
+    field: &'static str,
+    value: Duration,
+    max: Duration,
+) -> Result<(), AureliaError> {
+    if value.is_zero() {
+        return Err(config_relation_error(field, "must be > 0"));
+    }
+    check_max_duration(field, value, max)
+}
+
+fn check_le<T: PartialOrd>(
+    field: &'static str,
+    other_field: &'static str,
+    value: T,
+    other_value: T,
+) -> Result<(), AureliaError> {
+    if value > other_value {
+        return Err(config_relation_error(
+            field,
+            format!("must be <= {other_field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_ge_u64(
+    field: &'static str,
+    min_label: &'static str,
+    value: u64,
+    min: u64,
+) -> Result<(), AureliaError> {
+    if value < min {
+        return Err(config_relation_error(
+            field,
+            format!("must be >= {min_label} ({min})"),
+        ));
+    }
+    Ok(())
+}
+
 /// Fluent builder for [`DomusConfig`]. Each setter overrides the matching
 /// field and returns `Self` for chaining; [`DomusConfigBuilder::build`]
 /// validates the final configuration.
@@ -223,9 +332,9 @@ impl DomusConfigBuilder {
         self
     }
 
-    /// Sets [`DomusConfig::inflight_window`].
-    pub fn inflight_window(mut self, value: usize) -> Self {
-        self.config.inflight_window = value;
+    /// Sets [`DomusConfig::callis_connect_timeout`].
+    pub fn callis_connect_timeout(mut self, value: Duration) -> Self {
+        self.config.callis_connect_timeout = value;
         self
     }
 
@@ -313,15 +422,9 @@ impl DomusConfigBuilder {
         self
     }
 
-    /// Sets [`DomusConfig::blob_chunk_size`].
-    pub fn blob_chunk_size(mut self, value: u32) -> Self {
-        self.config.blob_chunk_size = value;
-        self
-    }
-
-    /// Sets [`DomusConfig::blob_ack_window`].
-    pub fn blob_ack_window(mut self, value: u32) -> Self {
-        self.config.blob_ack_window = value;
+    /// Sets [`DomusConfig::blob_window`].
+    pub fn blob_window(mut self, chunk_size: u32, ack_window: u32) -> Self {
+        self.config.blob_window = BlobWindowConfig::new(chunk_size, ack_window);
         self
     }
 
@@ -348,17 +451,7 @@ impl DomusConfigBuilder {
     /// is out of range or violates a cross-field invariant.
     pub fn build(self) -> Result<DomusConfig, AureliaError> {
         let (config, clamp) = normalize_domus_config(self.config, system_memory_bytes())?;
-        if clamp.any() {
-            warn!(
-                outbound_requested = clamp.outbound_requested,
-                inbound_requested = clamp.inbound_requested,
-                outbound_clamped = clamp.outbound_clamped,
-                inbound_clamped = clamp.inbound_clamped,
-                cap_bytes = clamp.cap_bytes,
-                total_memory_bytes = clamp.total_memory_bytes,
-                "blob buffer config clamped"
-            );
-        }
+        log_blob_clamp(&clamp);
         Ok(config)
     }
 }
@@ -389,11 +482,6 @@ impl DomusConfigAccess {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_config(config: DomusConfig) -> Self {
-        Self::new(Arc::new(DomusConfigStore::new(config)), None)
-    }
-
     /// Returns a snapshot of the currently effective configuration.
     pub async fn snapshot(&self) -> DomusConfig {
         self.inner.snapshot().await
@@ -403,70 +491,95 @@ impl DomusConfigAccess {
         self.inner.limited_registry()
     }
 
+    pub(crate) fn taberna_limits(&self) -> TabernaLimits {
+        self.inner.taberna_limits()
+    }
+
+    pub(crate) fn send_queue_size(&self) -> usize {
+        self.inner.send_queue_size()
+    }
+
     /// Validates `next` and atomically replaces the current configuration.
     /// Returns the (possibly clamped) configuration that was actually
     /// applied, or an [`AureliaError`] with [`ErrorId::InvalidConfig`] if
     /// validation fails.
     pub async fn update(&self, next: DomusConfig) -> Result<DomusConfig, AureliaError> {
         let (next, clamp) = normalize_domus_config(next, system_memory_bytes())?;
-        if clamp.any() {
-            warn!(
-                outbound_requested = clamp.outbound_requested,
-                inbound_requested = clamp.inbound_requested,
-                outbound_clamped = clamp.outbound_clamped,
-                inbound_clamped = clamp.inbound_clamped,
-                cap_bytes = clamp.cap_bytes,
-                total_memory_bytes = clamp.total_memory_bytes,
-                "blob buffer config clamped"
-            );
-        }
+        log_blob_clamp(&clamp);
         self.inner.update(next.clone()).await;
         if let Some(observability) = &self.observability {
-            observability.config_reloaded().await;
+            observability.config_reloaded();
         }
         Ok(next)
     }
 }
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
+impl DomusConfigAccess {
+    pub(crate) fn from_config(config: DomusConfig) -> Self {
+        Self::new(Arc::new(DomusConfigStore::new(config)), None)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct DomusConfigStore {
     inner: Arc<RwLock<DomusConfig>>,
-    limited_registry: Arc<limited::LimitedLogRegistry>,
-    limited_control: limited::LimitedLogControl,
+    limited: limited::LimitedLogContext,
+    taberna_accept_queue_size: AtomicUsize,
+    accept_timeout_nanos: AtomicU64,
+    send_queue_size: AtomicUsize,
 }
 
 impl DomusConfigStore {
     pub(crate) fn new(config: DomusConfig) -> Self {
-        let limited = limited::init_limited_logging(
-            limited::log_ids::LIMITED_LOG_IDS,
-            config.limited_log_interval,
-        );
+        let limited = limited::init_limited_logging(config.limited_log_interval);
+        let taberna_accept_queue_size = config.taberna_accept_queue_size;
+        let accept_timeout_nanos = duration_to_nanos(config.accept_timeout);
+        let send_queue_size = config.send_queue_size;
         Self {
             inner: Arc::new(RwLock::new(config)),
-            limited_registry: limited.registry(),
-            limited_control: limited.control(),
+            limited,
+            taberna_accept_queue_size: AtomicUsize::new(taberna_accept_queue_size),
+            accept_timeout_nanos: AtomicU64::new(accept_timeout_nanos),
+            send_queue_size: AtomicUsize::new(send_queue_size),
         }
     }
-}
 
-impl DomusConfigStore {
     pub(crate) async fn snapshot(&self) -> DomusConfig {
         self.inner.read().await.clone()
     }
 
     pub(crate) fn limited_registry(&self) -> Arc<limited::LimitedLogRegistry> {
-        Arc::clone(&self.limited_registry)
+        self.limited.registry()
+    }
+
+    pub(crate) fn taberna_limits(&self) -> TabernaLimits {
+        TabernaLimits {
+            accept_queue_size: self.taberna_accept_queue_size.load(Ordering::SeqCst),
+            accept_timeout: nanos_to_duration(self.accept_timeout_nanos.load(Ordering::SeqCst)),
+        }
+    }
+
+    pub(crate) fn send_queue_size(&self) -> usize {
+        self.send_queue_size.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn update(&self, next: DomusConfig) {
         let mut guard = self.inner.write().await;
         *guard = next;
-        self.limited_control
+        self.limited
+            .control()
             .set_interval(guard.limited_log_interval);
+        self.taberna_accept_queue_size
+            .store(guard.taberna_accept_queue_size, Ordering::SeqCst);
+        self.accept_timeout_nanos
+            .store(duration_to_nanos(guard.accept_timeout), Ordering::SeqCst);
+        self.send_queue_size
+            .store(guard.send_queue_size, Ordering::SeqCst);
         debug!(
             send_queue_size = guard.send_queue_size,
-            inflight_window = guard.inflight_window,
             send_timeout = ?guard.send_timeout,
+            callis_connect_timeout = ?guard.callis_connect_timeout,
             accept_timeout = ?guard.accept_timeout,
             taberna_accept_queue_size = guard.taberna_accept_queue_size,
             keepalive_interval = ?guard.keepalive_interval,
@@ -484,6 +597,12 @@ impl DomusConfigStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TabernaLimits {
+    pub(crate) accept_queue_size: usize,
+    pub(crate) accept_timeout: Duration,
+}
+
 fn normalize_domus_config(
     mut config: DomusConfig,
     total_memory_bytes: Option<u64>,
@@ -491,6 +610,32 @@ fn normalize_domus_config(
     let clamp = clamp_blob_buffers(&mut config, total_memory_bytes);
     validate_domus_config(&config, clamp.cap_bytes)?;
     Ok((config, clamp))
+}
+
+fn log_blob_clamp(clamp: &BlobBufferClamp) {
+    if clamp.any() {
+        warn!(
+            outbound_requested = clamp.outbound_requested,
+            inbound_requested = clamp.inbound_requested,
+            outbound_clamped = clamp.outbound_clamped,
+            inbound_clamped = clamp.inbound_clamped,
+            cap_bytes = clamp.cap_bytes,
+            total_memory_bytes = clamp.total_memory_bytes,
+            "blob buffer config clamped"
+        );
+    }
+}
+
+fn duration_to_nanos(duration: Duration) -> u64 {
+    duration
+        .as_nanos()
+        .min(u64::MAX as u128)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn nanos_to_duration(nanos: u64) -> Duration {
+    Duration::from_nanos(nanos)
 }
 
 fn clamp_blob_buffers(
@@ -516,198 +661,138 @@ fn clamp_blob_buffers(
 }
 
 fn validate_domus_config(config: &DomusConfig, buffer_cap: u64) -> Result<(), AureliaError> {
-    if config.send_queue_size == 0 || config.send_queue_size > MAX_SEND_QUEUE_SIZE {
-        return Err(config_range_error(
-            "send_queue_size",
-            1,
-            MAX_SEND_QUEUE_SIZE as u64,
-            config.send_queue_size as u64,
-        ));
-    }
-    if config.inflight_window == 0 || config.inflight_window > MAX_INFLIGHT_WINDOW {
-        return Err(config_range_error(
-            "inflight_window",
-            1,
-            MAX_INFLIGHT_WINDOW as u64,
-            config.inflight_window as u64,
-        ));
-    }
-    if config.taberna_accept_queue_size == 0
-        || config.taberna_accept_queue_size > MAX_TABERNA_ACCEPT_QUEUE_SIZE
-    {
-        return Err(config_range_error(
-            "taberna_accept_queue_size",
-            1,
-            MAX_TABERNA_ACCEPT_QUEUE_SIZE as u64,
-            config.taberna_accept_queue_size as u64,
-        ));
-    }
-    if config.max_payload_len == 0 || config.max_payload_len > MAX_MAX_PAYLOAD_LEN {
-        return Err(config_range_error(
-            "max_payload_len",
-            1,
-            MAX_MAX_PAYLOAD_LEN as u64,
-            config.max_payload_len as u64,
-        ));
-    }
-    if config.inbound_handshake_limit_total == 0
-        || config.inbound_handshake_limit_total > MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL
-    {
-        return Err(config_range_error(
-            "inbound_handshake_limit_total",
-            1,
-            MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL as u64,
-            config.inbound_handshake_limit_total as u64,
-        ));
-    }
-    if config.inbound_handshake_limit_per_peer == 0
-        || config.inbound_handshake_limit_per_peer > MAX_INBOUND_HANDSHAKE_LIMIT_PER_PEER
-    {
-        return Err(config_range_error(
-            "inbound_handshake_limit_per_peer",
-            1,
-            MAX_INBOUND_HANDSHAKE_LIMIT_PER_PEER as u64,
-            config.inbound_handshake_limit_per_peer as u64,
-        ));
-    }
-    if config.inbound_handshake_limit_per_peer > config.inbound_handshake_limit_total {
-        return Err(config_relation_error(
-            "inbound_handshake_limit_per_peer",
-            "must be <= inbound_handshake_limit_total",
-        ));
-    }
-    if config.max_parallel_callis_per_peer == 0
-        || config.max_parallel_callis_per_peer > MAX_PARALLEL_CALLIS_PER_PEER
-    {
-        return Err(config_range_error(
-            "max_parallel_callis_per_peer",
-            1,
-            MAX_PARALLEL_CALLIS_PER_PEER as u64,
-            config.max_parallel_callis_per_peer as u64,
-        ));
-    }
-    if config.blob_chunk_size == 0 || config.blob_chunk_size > MAX_BLOB_CHUNK_SIZE {
-        return Err(config_range_error(
-            "blob_chunk_size",
-            1,
-            MAX_BLOB_CHUNK_SIZE as u64,
-            config.blob_chunk_size as u64,
-        ));
-    }
-    if config.blob_ack_window == 0 || config.blob_ack_window > MAX_BLOB_ACK_WINDOW {
-        return Err(config_range_error(
-            "blob_ack_window",
-            1,
-            MAX_BLOB_ACK_WINDOW as u64,
-            config.blob_ack_window as u64,
-        ));
-    }
-    if config.blob_outbound_buffer_bytes > buffer_cap {
-        return Err(config_max_error(
-            "blob_outbound_buffer_bytes",
-            buffer_cap,
-            config.blob_outbound_buffer_bytes,
-        ));
-    }
-    if config.blob_inbound_buffer_bytes > buffer_cap {
-        return Err(config_max_error(
-            "blob_inbound_buffer_bytes",
-            buffer_cap,
-            config.blob_inbound_buffer_bytes,
-        ));
-    }
-    let required = (config.blob_chunk_size as u128) * (config.blob_ack_window as u128);
+    check_range(
+        "send_queue_size",
+        config.send_queue_size as u64,
+        MAX_SEND_QUEUE_SIZE as u64,
+    )?;
+    check_range(
+        "taberna_accept_queue_size",
+        config.taberna_accept_queue_size as u64,
+        MAX_TABERNA_ACCEPT_QUEUE_SIZE as u64,
+    )?;
+    check_range(
+        "max_payload_len",
+        config.max_payload_len as u64,
+        MAX_MAX_PAYLOAD_LEN as u64,
+    )?;
+    check_range(
+        "inbound_handshake_limit_total",
+        config.inbound_handshake_limit_total as u64,
+        MAX_INBOUND_HANDSHAKE_LIMIT_TOTAL as u64,
+    )?;
+    check_range(
+        "inbound_handshake_limit_per_peer",
+        config.inbound_handshake_limit_per_peer as u64,
+        MAX_INBOUND_HANDSHAKE_LIMIT_PER_PEER as u64,
+    )?;
+    check_le(
+        "inbound_handshake_limit_per_peer",
+        "inbound_handshake_limit_total",
+        config.inbound_handshake_limit_per_peer,
+        config.inbound_handshake_limit_total,
+    )?;
+    check_range(
+        "max_parallel_callis_per_peer",
+        config.max_parallel_callis_per_peer as u64,
+        MAX_PARALLEL_CALLIS_PER_PEER as u64,
+    )?;
+    check_range(
+        "blob_window.chunk_size",
+        config.blob_window.chunk_size() as u64,
+        MAX_BLOB_CHUNK_SIZE as u64,
+    )?;
+    check_range(
+        "blob_window.ack_window",
+        config.blob_window.ack_window() as u64,
+        MAX_BLOB_ACK_WINDOW as u64,
+    )?;
+    check_max_u64(
+        "blob_outbound_buffer_bytes",
+        config.blob_outbound_buffer_bytes,
+        buffer_cap,
+    )?;
+    check_max_u64(
+        "blob_inbound_buffer_bytes",
+        config.blob_inbound_buffer_bytes,
+        buffer_cap,
+    )?;
+    let required =
+        (config.blob_window.chunk_size() as u128) * (config.blob_window.ack_window() as u128);
     if required > u64::MAX as u128 {
         return Err(config_relation_error(
-            "blob_chunk_size",
+            "blob_window",
             "chunk_size * ack_window overflows reservation size",
         ));
     }
     let required = required as u64;
-    if config.blob_outbound_buffer_bytes < required {
-        return Err(config_relation_error(
-            "blob_outbound_buffer_bytes",
-            format!("must be >= blob_chunk_size * blob_ack_window ({required})"),
-        ));
-    }
-    if config.blob_inbound_buffer_bytes < required {
-        return Err(config_relation_error(
-            "blob_inbound_buffer_bytes",
-            format!("must be >= blob_chunk_size * blob_ack_window ({required})"),
-        ));
-    }
-    if config.send_timeout.is_zero() {
-        return Err(config_relation_error("send_timeout", "must be > 0"));
-    }
-    if config.send_timeout > MAX_SEND_TIMEOUT {
-        return Err(config_relation_error(
-            "send_timeout",
-            format!("must be <= {:?}", MAX_SEND_TIMEOUT),
-        ));
-    }
-    if config.accept_timeout.is_zero() {
-        return Err(config_relation_error("accept_timeout", "must be > 0"));
-    }
-    if config.accept_timeout > MAX_ACCEPT_TIMEOUT {
-        return Err(config_relation_error(
-            "accept_timeout",
-            format!("must be <= {:?}", MAX_ACCEPT_TIMEOUT),
-        ));
-    }
-    if config.accept_timeout > config.send_timeout {
-        return Err(config_relation_error(
-            "accept_timeout",
-            "must be <= send_timeout",
-        ));
-    }
-    if config.keepalive_interval > MAX_KEEPALIVE_INTERVAL {
-        return Err(config_relation_error(
-            "keepalive_interval",
-            format!("must be <= {:?}", MAX_KEEPALIVE_INTERVAL),
-        ));
-    }
-    if config.listener_delay > MAX_LISTENER_DELAY {
-        return Err(config_relation_error(
-            "listener_delay",
-            format!("must be <= {:?}", MAX_LISTENER_DELAY),
-        ));
-    }
-    if config.listener_reconnect_timeout > MAX_LISTENER_RECONNECT_TIMEOUT {
-        return Err(config_relation_error(
-            "listener_reconnect_timeout",
-            format!("must be <= {:?}", MAX_LISTENER_RECONNECT_TIMEOUT),
-        ));
-    }
-    if config.socket_callback_timeout > MAX_SOCKET_CALLBACK_TIMEOUT {
-        return Err(config_relation_error(
-            "socket_callback_timeout",
-            format!("must be <= {:?}", MAX_SOCKET_CALLBACK_TIMEOUT),
-        ));
-    }
-    if config.socket_handshake_timeout > MAX_SOCKET_HANDSHAKE_TIMEOUT {
-        return Err(config_relation_error(
-            "socket_handshake_timeout",
-            format!("must be <= {:?}", MAX_SOCKET_HANDSHAKE_TIMEOUT),
-        ));
-    }
-    if config.tcp_callback_timeout > MAX_TCP_CALLBACK_TIMEOUT {
-        return Err(config_relation_error(
-            "tcp_callback_timeout",
-            format!("must be <= {:?}", MAX_TCP_CALLBACK_TIMEOUT),
-        ));
-    }
-    if config.tcp_handshake_timeout > MAX_TCP_HANDSHAKE_TIMEOUT {
-        return Err(config_relation_error(
-            "tcp_handshake_timeout",
-            format!("must be <= {:?}", MAX_TCP_HANDSHAKE_TIMEOUT),
-        ));
-    }
-    if config.limited_log_interval > MAX_LIMITED_LOG_INTERVAL {
-        return Err(config_relation_error(
-            "limited_log_interval",
-            format!("must be <= {:?}", MAX_LIMITED_LOG_INTERVAL),
-        ));
-    }
+    check_ge_u64(
+        "blob_outbound_buffer_bytes",
+        "blob_window.chunk_size * blob_window.ack_window",
+        config.blob_outbound_buffer_bytes,
+        required,
+    )?;
+    check_ge_u64(
+        "blob_inbound_buffer_bytes",
+        "blob_window.chunk_size * blob_window.ack_window",
+        config.blob_inbound_buffer_bytes,
+        required,
+    )?;
+    check_range_duration("send_timeout", config.send_timeout, MAX_SEND_TIMEOUT)?;
+    check_range_duration(
+        "callis_connect_timeout",
+        config.callis_connect_timeout,
+        MAX_CALLIS_CONNECT_TIMEOUT,
+    )?;
+    check_le(
+        "callis_connect_timeout",
+        "send_timeout",
+        config.callis_connect_timeout,
+        config.send_timeout,
+    )?;
+    check_range_duration("accept_timeout", config.accept_timeout, MAX_ACCEPT_TIMEOUT)?;
+    check_le(
+        "accept_timeout",
+        "send_timeout",
+        config.accept_timeout,
+        config.send_timeout,
+    )?;
+    check_max_duration(
+        "keepalive_interval",
+        config.keepalive_interval,
+        MAX_KEEPALIVE_INTERVAL,
+    )?;
+    check_max_duration("listener_delay", config.listener_delay, MAX_LISTENER_DELAY)?;
+    check_max_duration(
+        "listener_reconnect_timeout",
+        config.listener_reconnect_timeout,
+        MAX_LISTENER_RECONNECT_TIMEOUT,
+    )?;
+    check_max_duration(
+        "socket_callback_timeout",
+        config.socket_callback_timeout,
+        MAX_SOCKET_CALLBACK_TIMEOUT,
+    )?;
+    check_max_duration(
+        "socket_handshake_timeout",
+        config.socket_handshake_timeout,
+        MAX_SOCKET_HANDSHAKE_TIMEOUT,
+    )?;
+    check_max_duration(
+        "tcp_callback_timeout",
+        config.tcp_callback_timeout,
+        MAX_TCP_CALLBACK_TIMEOUT,
+    )?;
+    check_max_duration(
+        "tcp_handshake_timeout",
+        config.tcp_handshake_timeout,
+        MAX_TCP_HANDSHAKE_TIMEOUT,
+    )?;
+    check_max_duration(
+        "limited_log_interval",
+        config.limited_log_interval,
+        MAX_LIMITED_LOG_INTERVAL,
+    )?;
     if config.reconnect_backoff.len() > MAX_RECONNECT_BACKOFF_STEPS {
         return Err(config_relation_error(
             "reconnect_backoff",
@@ -753,73 +838,5 @@ fn system_memory_bytes() -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn gib(value: u64) -> u64 {
-        value * 1024 * 1024 * 1024
-    }
-
-    #[test]
-    fn clamp_blob_buffers_to_half_memory_cap() {
-        let config = DomusConfig {
-            blob_outbound_buffer_bytes: gib(7),
-            blob_inbound_buffer_bytes: gib(9),
-            ..Default::default()
-        };
-
-        let (config, clamp) =
-            normalize_domus_config(config, Some(gib(10))).expect("valid config with clamp");
-
-        assert!(clamp.outbound_clamped);
-        assert!(clamp.inbound_clamped);
-        assert_eq!(clamp.cap_bytes, gib(5));
-        assert_eq!(config.blob_outbound_buffer_bytes, gib(5));
-        assert_eq!(config.blob_inbound_buffer_bytes, gib(5));
-    }
-
-    #[test]
-    fn reject_blob_buffers_below_reservation() {
-        let config = DomusConfig {
-            blob_chunk_size: MAX_BLOB_CHUNK_SIZE,
-            blob_ack_window: MAX_BLOB_ACK_WINDOW,
-            blob_outbound_buffer_bytes: gib(1),
-            blob_inbound_buffer_bytes: gib(1),
-            ..Default::default()
-        };
-
-        let err = normalize_domus_config(config, Some(gib(32))).expect_err("expected failure");
-        assert!(err.to_string().contains("blob_outbound_buffer_bytes"));
-    }
-
-    #[test]
-    fn reject_send_queue_size_over_max() {
-        let config = DomusConfig {
-            send_queue_size: MAX_SEND_QUEUE_SIZE + 1,
-            ..Default::default()
-        };
-        let err = normalize_domus_config(config, Some(gib(32))).expect_err("expected failure");
-        assert!(err.to_string().contains("send_queue_size"));
-    }
-
-    #[test]
-    fn reject_zero_send_timeout() {
-        let config = DomusConfig {
-            send_timeout: Duration::from_secs(0),
-            ..Default::default()
-        };
-        let err = normalize_domus_config(config, Some(gib(32))).expect_err("expected failure");
-        assert!(err.to_string().contains("send_timeout"));
-    }
-
-    #[test]
-    fn reject_zero_accept_timeout() {
-        let config = DomusConfig {
-            send_timeout: Duration::from_secs(1),
-            accept_timeout: Duration::from_secs(0),
-            ..Default::default()
-        };
-        let err = normalize_domus_config(config, Some(gib(32))).expect_err("expected failure");
-        assert!(err.to_string().contains("accept_timeout"));
-    }
-}
+#[path = "tests/config.rs"]
+mod tests;

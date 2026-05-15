@@ -39,7 +39,8 @@ The current preview ships the foundations:
 - **Authenticated transports.** mTLS over TCP and authenticated Unix
   sockets, with handshake completion before any application frames.
 - **Peering layer (A1).** Message and blob transfer, peer addressing,
-  connection lifecycle, and a pluggable route resolver.
+  connection lifecycle, a pluggable route resolver, and a simple in-memory
+  resolver for explicit topologies.
 - **Single error model.** One `AureliaError` type across the stack, with
   stable error IDs — no per-crate error zoos to translate between.
 - **A thin, owned runtime.** Aurelia owns its Tokio runtime so your

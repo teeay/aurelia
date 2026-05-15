@@ -5,13 +5,16 @@
 use super::*;
 use crate::session::CancelReason;
 use crate::transport::blob::io::{BlobReceiverStream, BlobSenderStream};
-use crate::transport::blob::BlobReceiverState;
+use crate::transport::blob::{BlobChunkOutcome, BlobReceiverState, BlobWriteLease};
+use crate::transport::callis::handle_inbound_frame;
 use crate::transport::callis::{drain_accept_waiters, send_inbound_outcome, InboundAction};
 use crate::BlobReceiver;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+
+const BLOB_MANAGER_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_MSG_TYPE: u32 = crate::a3_message_type(99);
 
 fn new_receiver(
     blob: &Arc<BlobManager>,
@@ -39,16 +42,15 @@ async fn apply_inbound_action(
     action: InboundAction,
     session: &Arc<PeerSession>,
     blob: &Arc<BlobManager>,
-    primary_dispatch: &Arc<PrimaryDispatchQueue>,
-    outbound_tx: &mpsc::Sender<OutboundFrame>,
+    primary_dispatch: &Arc<PrimaryDispatchManager>,
 ) {
     match action {
         InboundAction::None => {}
         InboundAction::Outcome(outcome) => {
             send_inbound_outcome(
                 CallisKind::Primary,
+                Some(blob),
                 Some(primary_dispatch),
-                outbound_tx,
                 outcome,
             )
             .await;
@@ -63,8 +65,8 @@ async fn apply_inbound_action(
             for outcome in outcomes {
                 send_inbound_outcome(
                     CallisKind::Primary,
+                    Some(blob),
                     Some(primary_dispatch),
-                    outbound_tx,
                     outcome,
                 )
                 .await;
@@ -80,6 +82,45 @@ fn blob_settings(chunk_size: u32, ack_window_chunks: u32) -> BlobCallisSettings 
     }
 }
 
+fn encode_blob_chunk_payload(payload: &BlobTransferChunkPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BlobTransferChunkPayload::HEADER_LEN + payload.chunk.len());
+    out.extend_from_slice(&payload.request_msg_id.to_be_bytes());
+    out.extend_from_slice(&payload.chunk_id.to_be_bytes());
+    out.extend_from_slice(&payload.flags.bits().to_be_bytes());
+    out.extend_from_slice(&(payload.chunk.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload.chunk);
+    out
+}
+
+fn leased_chunk(write: &BlobWriteLease) -> &crate::ring_buffer::ChunkWriteLease {
+    match write {
+        BlobWriteLease::Chunk { chunk, .. } => chunk,
+        BlobWriteLease::Ack { .. }
+        | BlobWriteLease::Error { .. }
+        | BlobWriteLease::Finish { .. } => {
+            panic!("expected chunk write lease")
+        }
+    }
+}
+
+fn new_blob_manager() -> BlobManager {
+    BlobManager::new(
+        Arc::new(BlobBufferTracker::default()),
+        Arc::new(Notify::new()),
+        Arc::new(PeerMessageIdAllocator::default()),
+        128,
+    )
+}
+
+fn new_blob_manager_with_send_queue(send_queue_size: usize) -> BlobManager {
+    BlobManager::new(
+        Arc::new(BlobBufferTracker::default()),
+        Arc::new(Notify::new()),
+        Arc::new(PeerMessageIdAllocator::default()),
+        send_queue_size,
+    )
+}
+
 async fn start_stream(
     blob: &Arc<BlobManager>,
     stream_id: PeerMessageId,
@@ -88,169 +129,30 @@ async fn start_stream(
     let (state, receiver) = new_receiver(blob, stream_id);
     blob.add_pending_request(stream_id, 7, Arc::clone(&state))
         .await;
-    let payload = BlobTransferStartPayload {
-        request_msg_id: stream_id,
-    }
-    .to_bytes();
-    handle_blob_transfer_start(blob, &payload, Duration::from_secs(1), settings)
+    blob.activate_pending_request(stream_id, settings)
         .await
-        .expect("start");
+        .expect("activate stream");
     receiver
 }
 
 #[tokio::test]
-async fn send_blob_frame_waits_for_matching_ack() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (tx, mut rx) = mpsc::channel(8);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let callis_id = next_callis_id();
-    let available = Arc::new(AtomicBool::new(true));
-    let handle = CallisHandle {
-        id: callis_id,
-        tx,
-        shutdown: shutdown_tx,
-        available: Arc::clone(&available),
-    };
-    let settings = BlobCallisSettings {
-        chunk_size: 4,
-        ack_window_chunks: 4,
-    };
-    blob.add_callis(handle, settings, true).await;
-    let _events_tx = spawn_blob_dispatcher(Arc::clone(&blob)).await;
-
-    let stream_id = 1;
-    let peer_msg_id = 7;
-    let ring = blob
-        .register_outbound_stream(stream_id, callis_id, settings)
-        .await
-        .expect("ring");
-    let blob_ref = Arc::clone(&blob);
-    let available_ref = Arc::clone(&available);
-    let notify = blob.dispatch_handle();
-    let (peer_state_tx, _peer_state_rx) = mpsc::channel(1);
-    let ack_task = tokio::spawn(async move {
-        if let Some(OutboundFrame::Control {
-            peer_msg_id: sent_id,
-            ..
-        }) = rx.recv().await
-        {
-            assert_eq!(sent_id, peer_msg_id);
-            blob_ref.handle_ack(peer_msg_id).await;
-            available_ref.store(true, Ordering::SeqCst);
-            notify.notify_waiters();
-        }
-    });
-
-    let frame = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_START,
-        peer_msg_id,
-        payload: Bytes::new(),
-    };
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let result = send_blob_control_and_wait_ack(
-        blob.as_ref(),
-        ring.as_ref(),
-        stream_id,
-        peer_msg_id,
-        RetainedBlobKind::Start,
-        frame,
-        deadline,
-        &peer_state_tx,
-    )
-    .await;
-    ack_task.await.expect("ack task");
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn send_blob_frame_reports_error_event() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (tx, mut rx) = mpsc::channel(8);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let callis_id = next_callis_id();
-    let available = Arc::new(AtomicBool::new(true));
-    let handle = CallisHandle {
-        id: callis_id,
-        tx,
-        shutdown: shutdown_tx,
-        available: Arc::clone(&available),
-    };
-    let settings = BlobCallisSettings {
-        chunk_size: 4,
-        ack_window_chunks: 4,
-    };
-    blob.add_callis(handle, settings, true).await;
-    let _events_tx = spawn_blob_dispatcher(Arc::clone(&blob)).await;
-
-    let stream_id = 2;
-    let peer_msg_id = 9;
-    let ring = blob
-        .register_outbound_stream(stream_id, callis_id, settings)
-        .await
-        .expect("ring");
-    let blob_ref = Arc::clone(&blob);
-    let available_ref = Arc::clone(&available);
-    let notify = blob.dispatch_handle();
-    let err_task = tokio::spawn(async move {
-        if let Some(OutboundFrame::Control {
-            peer_msg_id: sent_id,
-            ..
-        }) = rx.recv().await
-        {
-            assert_eq!(sent_id, peer_msg_id);
-            blob_ref
-                .handle_error(peer_msg_id, AureliaError::new(ErrorId::PeerUnavailable))
-                .await;
-            available_ref.store(true, Ordering::SeqCst);
-            notify.notify_waiters();
-        }
-    });
-
-    let frame = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_START,
-        peer_msg_id,
-        payload: Bytes::new(),
-    };
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let (peer_state_tx, _peer_state_rx) = mpsc::channel(1);
-    let result = send_blob_control_and_wait_ack(
-        blob.as_ref(),
-        ring.as_ref(),
-        stream_id,
-        peer_msg_id,
-        RetainedBlobKind::Start,
-        frame,
-        deadline,
-        &peer_state_tx,
-    )
-    .await;
-    err_task.await.expect("error task");
-    assert!(matches!(result, Err(err) if err.kind == ErrorId::PeerUnavailable));
-}
-
-#[tokio::test]
-async fn blob_transfer_start_registers_stream() {
-    let blob = Arc::new(BlobManager::new_for_tests());
+async fn blob_pending_request_activation_registers_stream() {
+    let blob = Arc::new(new_blob_manager());
     let stream_id = 42;
     let (state, receiver) = new_receiver(&blob, stream_id);
     blob.add_pending_request(stream_id, 7, state).await;
 
-    let payload = BlobTransferStartPayload {
-        request_msg_id: stream_id,
-    }
-    .to_bytes();
     let result = timeout(
         Duration::from_secs(1),
-        handle_blob_transfer_start(&blob, &payload, Duration::from_secs(1), blob_settings(4, 4)),
+        blob.activate_pending_request(stream_id, blob_settings(4, 4)),
     )
     .await
-    .expect("start timeout");
+    .expect("activation timeout");
     assert!(result.is_ok());
-    let recv = timeout(Duration::from_secs(1), blob.recv_streams.lock())
+    let contains = timeout(Duration::from_secs(1), blob.recv_stream_exists(stream_id))
         .await
-        .expect("recv lock timeout");
-    assert!(recv.contains_key(&stream_id));
-    drop(recv);
+        .expect("recv lookup timeout");
+    assert!(contains);
     let active = timeout(Duration::from_secs(1), blob.has_active_streams())
         .await
         .expect("active timeout");
@@ -259,78 +161,86 @@ async fn blob_transfer_start_registers_stream() {
 }
 
 #[tokio::test]
-async fn blob_transfer_start_open_timeout_is_error() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 19;
-    let payload = BlobTransferStartPayload {
-        request_msg_id: stream_id,
-    }
-    .to_bytes();
+async fn blob_pending_request_activation_without_request_is_error() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 19;
 
-    let err =
-        handle_blob_transfer_start(&blob, &payload, Duration::from_secs(1), blob_settings(4, 4))
+        let err = blob
+            .activate_pending_request(stream_id, blob_settings(4, 4))
             .await
             .expect_err("expected missing pending request");
-    assert_eq!(err.kind, ErrorId::BlobStreamNotFound);
+        assert_eq!(err.kind, ErrorId::BlobStreamNotFound);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
-async fn blob_transfer_start_is_idempotent() {
-    let blob = Arc::new(BlobManager::new_for_tests());
+async fn blob_pending_request_activation_is_idempotent() {
+    let blob = Arc::new(new_blob_manager());
     let stream_id = 11;
     let (state, receiver) = new_receiver(&blob, stream_id);
     blob.add_pending_request(stream_id, 9, state).await;
 
-    let payload = BlobTransferStartPayload {
-        request_msg_id: stream_id,
-    }
-    .to_bytes();
     timeout(
         Duration::from_secs(1),
-        handle_blob_transfer_start(&blob, &payload, Duration::from_secs(1), blob_settings(4, 4)),
+        blob.activate_pending_request(stream_id, blob_settings(4, 4)),
     )
     .await
-    .expect("start timeout")
-    .expect("start");
+    .expect("activation timeout")
+    .expect("activate");
     timeout(
         Duration::from_secs(1),
-        handle_blob_transfer_start(&blob, &payload, Duration::from_secs(1), blob_settings(4, 4)),
+        blob.activate_pending_request(stream_id, blob_settings(4, 4)),
     )
     .await
-    .expect("start duplicate timeout")
-    .expect("start duplicate");
+    .expect("activation duplicate timeout")
+    .expect("activation duplicate");
 
-    let recv = timeout(Duration::from_secs(1), blob.recv_streams.lock())
+    use tokio::io::AsyncReadExt;
+
+    let mut receiver = receiver;
+    let mut data = Vec::new();
+    let chunk = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+        request_msg_id: stream_id,
+        chunk_id: 0,
+        flags: BlobChunkFlags::LAST_CHUNK,
+        chunk: Bytes::from_static(b"done"),
+    });
+    handle_blob_transfer_chunk(&blob, &chunk, Duration::from_secs(1), 4, 4)
         .await
-        .expect("recv lock timeout");
-    assert_eq!(recv.len(), 1);
+        .expect("chunk after duplicate start");
+    timeout(Duration::from_secs(1), receiver.read_to_end(&mut data))
+        .await
+        .expect("read timeout")
+        .expect("read chunk");
+    assert_eq!(data, b"done");
     drop(receiver);
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_happy_path() {
-    let blob = Arc::new(BlobManager::new_for_tests());
+    let blob = Arc::new(new_blob_manager());
     let stream_id = 99;
     let mut receiver = start_stream(&blob, stream_id, blob_settings(3, 4)).await;
 
-    let first = BlobTransferChunkPayload {
+    let first = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 0,
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"abc"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &first, Duration::from_secs(1), 4, 3)
         .await
         .expect("chunk 0");
 
-    let last = BlobTransferChunkPayload {
+    let last = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 1,
         flags: BlobChunkFlags::LAST_CHUNK,
         chunk: Bytes::from_static(b"def"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &last, Duration::from_secs(1), 4, 3)
         .await
         .expect("chunk 1");
@@ -345,8 +255,41 @@ async fn blob_transfer_chunk_happy_path() {
 }
 
 #[tokio::test]
+async fn blob_transfer_chunk_full_receiver_returns_without_idle_wait() {
+    let blob = Arc::new(new_blob_manager());
+    let stream_id = 199;
+    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 1)).await;
+
+    let first = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+        request_msg_id: stream_id,
+        chunk_id: 0,
+        flags: BlobChunkFlags::empty(),
+        chunk: Bytes::from_static(b"one"),
+    });
+    handle_blob_transfer_chunk(&blob, &first, Duration::from_secs(60), 1, 4)
+        .await
+        .expect("first chunk accepted");
+
+    let second = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+        request_msg_id: stream_id,
+        chunk_id: 1,
+        flags: BlobChunkFlags::empty(),
+        chunk: Bytes::from_static(b"two"),
+    });
+    let err = timeout(
+        Duration::from_millis(100),
+        handle_blob_transfer_chunk(&blob, &second, Duration::from_secs(60), 1, 4),
+    )
+    .await
+    .expect("full receiver must not wait for idle timeout")
+    .expect_err("full receiver must reject the stream");
+    assert_eq!(err.kind, ErrorId::BlobBufferFull);
+    assert!(!blob.recv_stream_exists(stream_id).await);
+}
+
+#[tokio::test]
 async fn blob_transfer_chunk_out_of_order_is_buffered() {
-    let blob = Arc::new(BlobManager::new_for_tests());
+    let blob = Arc::new(new_blob_manager());
     let stream_id = 77;
     let mut receiver = start_stream(&blob, stream_id, blob_settings(3, 4)).await;
 
@@ -360,46 +303,42 @@ async fn blob_transfer_chunk_out_of_order_is_buffered() {
         data
     });
 
-    let first = BlobTransferChunkPayload {
+    let first = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 0,
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"abc"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &first, Duration::from_secs(1), 4, 3)
         .await
         .expect("chunk 0");
 
-    let out_of_order = BlobTransferChunkPayload {
+    let out_of_order = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 2,
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"two"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &out_of_order, Duration::from_secs(1), 4, 3)
         .await
         .expect("buffered chunk 2");
 
-    let middle = BlobTransferChunkPayload {
+    let middle = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 1,
         flags: BlobChunkFlags::empty(),
         chunk: Bytes::from_static(b"one"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &middle, Duration::from_secs(1), 4, 3)
         .await
         .expect("chunk 1");
 
-    let last = BlobTransferChunkPayload {
+    let last = encode_blob_chunk_payload(&BlobTransferChunkPayload {
         request_msg_id: stream_id,
         chunk_id: 3,
         flags: BlobChunkFlags::LAST_CHUNK,
         chunk: Bytes::from_static(b"end"),
-    }
-    .to_bytes();
+    });
     handle_blob_transfer_chunk(&blob, &last, Duration::from_secs(1), 4, 3)
         .await
         .expect("chunk 3");
@@ -410,198 +349,273 @@ async fn blob_transfer_chunk_out_of_order_is_buffered() {
 
 #[tokio::test]
 async fn blob_transfer_chunk_ack_window_exceeded_is_error() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 66;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 66;
+        let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
 
-    let too_far = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 4,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"oops"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &too_far, Duration::from_secs(1), 4, 4)
-        .await
-        .expect_err("expected ack window exceeded");
-    assert_eq!(err.kind, ErrorId::BlobAckWindowExceeded);
+        let too_far = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 4,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"oops"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &too_far, Duration::from_secs(1), 4, 4)
+            .await
+            .expect_err("expected ack window exceeded");
+        assert_eq!(err.kind, ErrorId::BlobAckWindowExceeded);
+        assert!(!blob.recv_stream_exists(stream_id).await);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_rejects_oversized_chunk() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 67;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 67;
+        let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
 
-    let too_large = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 0,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"toolong"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &too_large, Duration::from_secs(1), 4, 4)
-        .await
-        .expect_err("expected oversized chunk error");
-    assert_eq!(err.kind, ErrorId::ProtocolViolation);
+        let too_large = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 0,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"toolong"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &too_large, Duration::from_secs(1), 4, 4)
+            .await
+            .expect_err("expected oversized chunk error");
+        assert_eq!(err.kind, ErrorId::ProtocolViolation);
+        assert!(!blob.recv_stream_exists(stream_id).await);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_unknown_stream_is_error() {
-    let blob = BlobManager::new_for_tests();
-    let payload = BlobTransferChunkPayload {
-        request_msg_id: 123,
-        chunk_id: 0,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"nope"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_secs(1), 4, 4)
-        .await
-        .expect_err("expected not found");
-    assert_eq!(err.kind, ErrorId::BlobStreamNotFound);
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager();
+        let payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: 123,
+            chunk_id: 0,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"nope"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_secs(1), 4, 4)
+            .await
+            .expect_err("expected not found");
+        assert_eq!(err.kind, ErrorId::BlobStreamNotFound);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_idle_timeout_is_error() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 88;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 88;
+        let state = Arc::new(BlobReceiverState {
+            notify: Arc::new(Notify::new()),
+            accepted: AtomicBool::new(true),
+            completed: AtomicBool::new(false),
+            error: Mutex::new(None),
+            completion_ttl: Duration::from_secs(1),
+            idle_timeout: Duration::from_millis(1),
+        });
+        let stream = BlobReceiverStream::new(
+            Arc::clone(&blob),
+            stream_id,
+            Arc::clone(&state),
+            tokio::runtime::Handle::current(),
+        );
+        let _receiver = BlobReceiver::new(Box::new(stream));
+        blob.add_pending_request(stream_id, 7, Arc::clone(&state))
+            .await;
+        blob.activate_pending_request(stream_id, blob_settings(4, 4))
+            .await
+            .expect("activate");
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
-    {
-        let mut recv = blob.recv_streams.lock().await;
-        let state = recv.get_mut(&stream_id).expect("stream");
-        state.last_activity = Instant::now() - Duration::from_secs(5);
-    }
+        let payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 0,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"late"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_millis(1), 4, 4)
+            .await
+            .expect_err("expected idle timeout");
+        assert_eq!(err.kind, ErrorId::BlobStreamIdleTimeout);
+        assert!(!blob.recv_stream_exists(stream_id).await);
+    })
+    .await
+    .expect("async test timed out");
+}
 
-    let payload = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 0,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"late"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_secs(1), 4, 4)
+#[tokio::test]
+async fn blob_inbound_idle_reaper_expires_without_more_chunks() {
+    let blob = Arc::new(new_blob_manager());
+    let stream_id = 188;
+    let state = Arc::new(BlobReceiverState {
+        notify: Arc::new(Notify::new()),
+        accepted: AtomicBool::new(true),
+        completed: AtomicBool::new(false),
+        error: Mutex::new(None),
+        completion_ttl: Duration::from_secs(1),
+        idle_timeout: Duration::from_millis(10),
+    });
+    let _receiver = BlobReceiver::new(Box::new(BlobReceiverStream::new(
+        Arc::clone(&blob),
+        stream_id,
+        Arc::clone(&state),
+        tokio::runtime::Handle::current(),
+    )));
+    blob.add_pending_request(stream_id, 7, Arc::clone(&state))
+        .await;
+    blob.activate_pending_request(stream_id, blob_settings(4, 4))
         .await
-        .expect_err("expected idle timeout");
+        .expect("activate");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let reaper_blob = Arc::clone(&blob);
+    let reaper = tokio::spawn(async move {
+        reaper_blob.run_inbound_idle_reaper(shutdown_rx).await;
+    });
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if !blob.recv_stream_exists(stream_id).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("idle reaper timeout");
+    let err = state.error.lock().await.clone().expect("receiver error");
     assert_eq!(err.kind, ErrorId::BlobStreamIdleTimeout);
-    let recv = blob.recv_streams.lock().await;
-    assert!(!recv.contains_key(&stream_id));
+    let _ = shutdown_tx.send(true);
+    reaper.await.expect("reaper join");
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_dedupes_after_completion_concurrently() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 101;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 101;
+        let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
 
-    let final_payload = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 0,
-        flags: BlobChunkFlags::LAST_CHUNK,
-        chunk: Bytes::from_static(b"done"),
-    }
-    .to_bytes();
-    let outcome = handle_blob_transfer_chunk(&blob, &final_payload, Duration::from_secs(1), 4, 4)
-        .await
-        .expect("final chunk");
-    assert!(matches!(outcome, BlobChunkOutcome::Complete(id) if id == stream_id));
+        let final_payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 0,
+            flags: BlobChunkFlags::LAST_CHUNK,
+            chunk: Bytes::from_static(b"done"),
+        });
+        let outcome =
+            handle_blob_transfer_chunk(&blob, &final_payload, Duration::from_secs(1), 4, 4)
+                .await
+                .expect("final chunk");
+        assert!(matches!(outcome, BlobChunkOutcome::Complete(id) if id == stream_id));
 
-    let dup_payload = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 0,
-        flags: BlobChunkFlags::LAST_CHUNK,
-        chunk: Bytes::from_static(b"done"),
-    }
-    .to_bytes();
-    let fut1 = handle_blob_transfer_chunk(&blob, &dup_payload, Duration::from_secs(1), 4, 4);
-    let fut2 = handle_blob_transfer_chunk(&blob, &dup_payload, Duration::from_secs(1), 4, 4);
-    let (res1, res2) = tokio::join!(fut1, fut2);
+        let dup_payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 0,
+            flags: BlobChunkFlags::LAST_CHUNK,
+            chunk: Bytes::from_static(b"done"),
+        });
+        let fut1 = handle_blob_transfer_chunk(&blob, &dup_payload, Duration::from_secs(1), 4, 4);
+        let fut2 = handle_blob_transfer_chunk(&blob, &dup_payload, Duration::from_secs(1), 4, 4);
+        let (res1, res2) = tokio::join!(fut1, fut2);
 
-    assert!(
-        matches!(res1, Ok(BlobChunkOutcome::Complete(id)) if id == stream_id)
-            || matches!(res1, Ok(BlobChunkOutcome::Continue))
-    );
-    assert!(
-        matches!(res2, Ok(BlobChunkOutcome::Complete(id)) if id == stream_id)
-            || matches!(res2, Ok(BlobChunkOutcome::Continue))
-    );
+        assert!(matches!(res1, Ok(BlobChunkOutcome::Continue)));
+        assert!(matches!(res2, Ok(BlobChunkOutcome::Continue)));
+    })
+    .await
+    .expect("async test timed out");
 }
 #[tokio::test]
 async fn blob_transfer_chunk_missing_before_last_is_error() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 121;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 121;
+        let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
 
-    let last = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 1,
-        flags: BlobChunkFlags::LAST_CHUNK,
-        chunk: Bytes::from_static(b"late"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &last, Duration::from_secs(1), 4, 4)
-        .await
-        .expect_err("expected missing chunk");
-    assert_eq!(err.kind, ErrorId::BlobStreamMissingChunk);
+        let last = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 1,
+            flags: BlobChunkFlags::LAST_CHUNK,
+            chunk: Bytes::from_static(b"late"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &last, Duration::from_secs(1), 4, 4)
+            .await
+            .expect_err("expected missing chunk");
+        assert_eq!(err.kind, ErrorId::BlobStreamMissingChunk);
+        assert!(!blob.recv_stream_exists(stream_id).await);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn blob_transfer_chunk_missing_buffer_full_is_error() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let stream_id = 122;
-    let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let stream_id = 122;
+        let _receiver = start_stream(&blob, stream_id, blob_settings(4, 4)).await;
 
-    let first = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 0,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"zero"),
-    }
-    .to_bytes();
-    handle_blob_transfer_chunk(&blob, &first, Duration::from_secs(1), 4, 4)
-        .await
-        .expect("chunk 0");
+        let first = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 0,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"zero"),
+        });
+        handle_blob_transfer_chunk(&blob, &first, Duration::from_secs(1), 4, 4)
+            .await
+            .expect("chunk 0");
 
-    let second = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 2,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"two"),
-    }
-    .to_bytes();
-    handle_blob_transfer_chunk(&blob, &second, Duration::from_secs(1), 4, 4)
-        .await
-        .expect("chunk 2");
+        let second = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 2,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"two"),
+        });
+        handle_blob_transfer_chunk(&blob, &second, Duration::from_secs(1), 4, 4)
+            .await
+            .expect("chunk 2");
 
-    let third = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 3,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"tre"),
-    }
-    .to_bytes();
-    handle_blob_transfer_chunk(&blob, &third, Duration::from_secs(1), 4, 4)
-        .await
-        .expect("chunk 3");
+        let third = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 3,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"tre"),
+        });
+        handle_blob_transfer_chunk(&blob, &third, Duration::from_secs(1), 4, 4)
+            .await
+            .expect("chunk 3");
 
-    let payload = BlobTransferChunkPayload {
-        request_msg_id: stream_id,
-        chunk_id: 4,
-        flags: BlobChunkFlags::empty(),
-        chunk: Bytes::from_static(b"for"),
-    }
-    .to_bytes();
-    let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_secs(1), 4, 4)
-        .await
-        .expect_err("expected missing chunk");
-    assert_eq!(err.kind, ErrorId::BlobStreamMissingChunk);
+        let payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+            request_msg_id: stream_id,
+            chunk_id: 4,
+            flags: BlobChunkFlags::empty(),
+            chunk: Bytes::from_static(b"for"),
+        });
+        let err = handle_blob_transfer_chunk(&blob, &payload, Duration::from_secs(1), 4, 4)
+            .await
+            .expect_err("expected missing chunk");
+        assert_eq!(err.kind, ErrorId::BlobStreamMissingChunk);
+        assert!(!blob.recv_stream_exists(stream_id).await);
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]
 async fn blob_request_registers_pending_and_acks() {
     let registry = Arc::new(TabernaRegistry::new());
-    let sink = Arc::new(RecordingSink::new(vec![99]));
+    let sink = Arc::new(RecordingSink::new(vec![APP_MSG_TYPE]));
     let taberna_id = 42;
     registry.register(taberna_id, sink.clone()).await.unwrap();
 
@@ -610,13 +624,12 @@ async fn blob_request_registers_pending_and_acks() {
         Arc::new(PeerMessageIdAllocator::default()),
         config.clone(),
         tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
     ));
     session.set_active(true);
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (callis_tx, _callis_rx) = mpsc::channel(4);
+    let blob = Arc::new(new_blob_manager());
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let callis_id = next_callis_id();
-    let available = Arc::new(AtomicBool::new(true));
     let settings = BlobCallisSettings {
         chunk_size: 4,
         ack_window_chunks: 4,
@@ -624,16 +637,13 @@ async fn blob_request_registers_pending_and_acks() {
     blob.add_callis(
         CallisHandle {
             id: callis_id,
-            tx: callis_tx,
+            tx: CallisTx::Blob,
             shutdown: shutdown_tx,
-            available: Arc::clone(&available),
         },
         settings,
         true,
     )
     .await;
-
-    let (outbound_tx, _outbound_rx) = mpsc::channel(4);
     let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
     let callis_id = next_callis_id();
     let primary_dispatch = session.primary_dispatch();
@@ -642,7 +652,7 @@ async fn blob_request_registers_pending_and_acks() {
     let header = WireHeader {
         version: PROTOCOL_VERSION,
         flags: WireFlags::BLOB.bits(),
-        msg_type: 99,
+        msg_type: APP_MSG_TYPE,
         peer_msg_id: 10,
         src_taberna: 1,
         dst_taberna: taberna_id,
@@ -658,18 +668,16 @@ async fn blob_request_registers_pending_and_acks() {
         config.clone(),
         events_tx,
         callis_id,
-        CallisKind::Primary,
         Some(Arc::clone(&primary_dispatch)),
         header,
         payload,
-        outbound_tx.clone(),
         CancelReason::None,
         accept_notify,
         &cancel_tx,
     )
     .await
     .expect("handle inbound");
-    apply_inbound_action(action, &session, &blob, &primary_dispatch, &outbound_tx).await;
+    apply_inbound_action(action, &session, &blob, &primary_dispatch).await;
 
     let frame = timeout(Duration::from_secs(1), async {
         loop {
@@ -683,7 +691,7 @@ async fn blob_request_registers_pending_and_acks() {
     .expect("ack timeout");
     assert!(matches!(frame, OutboundFrame::Ack { peer_msg_id: 10 }));
     assert!(session.is_duplicate(10).await);
-    assert!(blob.take_pending_request(10).await.is_some());
+    assert!(blob.recv_stream_exists(10).await);
     let received = sink.take().await;
     assert_eq!(received.len(), 1);
     assert!(received[0].2.is_some());
@@ -699,10 +707,10 @@ async fn blob_request_missing_taberna_is_error() {
         Arc::new(PeerMessageIdAllocator::default()),
         config.clone(),
         tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
     ));
     session.set_active(true);
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+    let blob = Arc::new(new_blob_manager());
     let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
     let callis_id = next_callis_id();
     let primary_dispatch = session.primary_dispatch();
@@ -711,7 +719,7 @@ async fn blob_request_missing_taberna_is_error() {
     let header = WireHeader {
         version: PROTOCOL_VERSION,
         flags: WireFlags::BLOB.bits(),
-        msg_type: 99,
+        msg_type: APP_MSG_TYPE,
         peer_msg_id: 11,
         src_taberna: 1,
         dst_taberna: taberna_id,
@@ -727,18 +735,16 @@ async fn blob_request_missing_taberna_is_error() {
         config.clone(),
         events_tx,
         callis_id,
-        CallisKind::Primary,
         Some(Arc::clone(&primary_dispatch)),
         header,
         payload,
-        outbound_tx.clone(),
         CancelReason::None,
         accept_notify,
         &cancel_tx,
     )
     .await
     .expect("handle inbound");
-    apply_inbound_action(action, &session, &blob, &primary_dispatch, &outbound_tx).await;
+    apply_inbound_action(action, &session, &blob, &primary_dispatch).await;
 
     let frame = timeout(Duration::from_secs(1), async {
         loop {
@@ -764,7 +770,7 @@ async fn blob_request_missing_taberna_is_error() {
 #[tokio::test]
 async fn blob_request_without_primary_is_error() {
     let registry = Arc::new(TabernaRegistry::new());
-    let sink = Arc::new(RecordingSink::new(vec![99]));
+    let sink = Arc::new(RecordingSink::new(vec![APP_MSG_TYPE]));
     let taberna_id = 88;
     registry.register(taberna_id, sink).await.unwrap();
 
@@ -773,9 +779,9 @@ async fn blob_request_without_primary_is_error() {
         Arc::new(PeerMessageIdAllocator::default()),
         config.clone(),
         tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
     ));
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (outbound_tx, _outbound_rx) = mpsc::channel(4);
+    let blob = Arc::new(new_blob_manager());
     let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
     let callis_id = next_callis_id();
     let primary_dispatch = session.primary_dispatch();
@@ -784,7 +790,7 @@ async fn blob_request_without_primary_is_error() {
     let header = WireHeader {
         version: PROTOCOL_VERSION,
         flags: WireFlags::BLOB.bits(),
-        msg_type: 99,
+        msg_type: APP_MSG_TYPE,
         peer_msg_id: 12,
         src_taberna: 1,
         dst_taberna: taberna_id,
@@ -800,18 +806,16 @@ async fn blob_request_without_primary_is_error() {
         config.clone(),
         events_tx,
         callis_id,
-        CallisKind::Primary,
         Some(Arc::clone(&primary_dispatch)),
         header,
         payload,
-        outbound_tx.clone(),
         CancelReason::None,
         accept_notify,
         &cancel_tx,
     )
     .await
     .expect("handle inbound");
-    apply_inbound_action(action, &session, &blob, &primary_dispatch, &outbound_tx).await;
+    apply_inbound_action(action, &session, &blob, &primary_dispatch).await;
 
     let frame = timeout(Duration::from_secs(1), async {
         loop {
@@ -843,9 +847,9 @@ async fn blob_transfer_complete_is_acked_and_signals_stream() {
         Arc::new(PeerMessageIdAllocator::default()),
         config.clone(),
         tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
     ));
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (outbound_tx, mut outbound_rx) = mpsc::channel(4);
+    let blob = Arc::new(new_blob_manager());
     let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
 
     let stream_id = 200;
@@ -854,7 +858,7 @@ async fn blob_transfer_complete_is_acked_and_signals_stream() {
         ack_window_chunks: 4,
     };
     let ring = blob
-        .register_outbound_stream(stream_id, next_callis_id(), settings)
+        .register_outbound_stream(stream_id, settings)
         .await
         .expect("ring");
 
@@ -882,11 +886,9 @@ async fn blob_transfer_complete_is_acked_and_signals_stream() {
         config.clone(),
         events_tx,
         next_callis_id(),
-        CallisKind::Blob,
         None,
         header,
         payload,
-        outbound_tx,
         CancelReason::None,
         accept_notify,
         &cancel_tx,
@@ -894,11 +896,14 @@ async fn blob_transfer_complete_is_acked_and_signals_stream() {
     .await
     .expect("handle inbound");
 
-    let frame = timeout(Duration::from_secs(1), outbound_rx.recv())
-        .await
-        .expect("ack timeout")
-        .expect("ack frame");
-    assert!(matches!(frame, OutboundFrame::Ack { peer_msg_id: 77 }));
+    let frame = timeout(
+        Duration::from_secs(1),
+        blob.lease_next_blob_write(next_callis_id()),
+    )
+    .await
+    .expect("ack timeout")
+    .expect("ack frame");
+    assert!(matches!(frame, BlobWriteLease::Ack { peer_msg_id: 77 }));
 
     let deadline = Instant::now() + Duration::from_secs(1);
     ring.wait_for_complete(deadline)
@@ -907,258 +912,985 @@ async fn blob_transfer_complete_is_acked_and_signals_stream() {
 }
 
 #[tokio::test]
-async fn blob_callis_selection_skips_closed_handles() {
-    let blob = BlobManager::new_for_tests();
-    let (tx, rx) = mpsc::channel(1);
-    drop(rx);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let callis_id = next_callis_id();
-    let available = Arc::new(AtomicBool::new(true));
+async fn blob_response_control_dedupes_by_peer_msg_id() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager();
+
+        assert!(
+            blob.enqueue_blob_write(BlobWriteLease::Ack { peer_msg_id: 55 })
+                .await
+        );
+        assert!(
+            !blob
+                .enqueue_blob_write(BlobWriteLease::Ack { peer_msg_id: 55 })
+                .await
+        );
+
+        let write = blob
+            .lease_next_blob_write(next_callis_id())
+            .await
+            .expect("deduped ack");
+        assert!(matches!(write, BlobWriteLease::Ack { peer_msg_id: 55 }));
+        blob.finish_blob_write_attempt(&write, next_callis_id(), Ok(()))
+            .await;
+        assert!(blob.lease_next_blob_write(next_callis_id()).await.is_none());
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[test]
+#[should_panic(expected = "blob buffer release underflow")]
+fn blob_buffer_release_underflow_is_guarded() {
+    let tracker = BlobBufferTracker::default();
+    tracker.release_outbound(1);
+}
+
+#[tokio::test]
+async fn blob_response_ack_lane_is_bounded() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager_with_send_queue(1);
+        for peer_msg_id in 0..16 {
+            assert!(
+                blob.enqueue_blob_write(BlobWriteLease::Ack { peer_msg_id })
+                    .await,
+                "ack {peer_msg_id} should fit"
+            );
+        }
+        assert!(
+            !blob
+                .enqueue_blob_write(BlobWriteLease::Ack { peer_msg_id: 16 })
+                .await
+        );
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_response_cleanup_removes_stream_writes() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager();
+        let stream_id = 90;
+        let peer_msg_id = 91;
+        let payload = BlobTransferCompletePayload {
+            request_msg_id: stream_id,
+        };
+        assert!(
+            blob.enqueue_blob_write(BlobWriteLease::Finish {
+                stream_id,
+                peer_msg_id,
+                payload: Bytes::from(payload.to_bytes().to_vec()),
+            })
+            .await
+        );
+
+        blob.fail_stream(stream_id, AureliaError::new(ErrorId::PeerUnavailable))
+            .await;
+        assert!(blob.lease_next_blob_write(next_callis_id()).await.is_none());
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_response_cleanup_keeps_unscoped_ack_and_error_writes() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager();
+        let stream_id = 900;
+        blob.register_outbound_stream(stream_id, blob_settings(4, 4))
+            .await
+            .expect("register stream");
+        assert!(
+            blob.enqueue_blob_write(BlobWriteLease::Ack {
+                peer_msg_id: stream_id,
+            })
+            .await
+        );
+        assert!(
+            blob.enqueue_blob_write(BlobWriteLease::Error {
+                peer_msg_id: stream_id + 1,
+                payload: Bytes::from_static(b"error"),
+            })
+            .await
+        );
+
+        blob.unregister_outbound_stream(stream_id).await;
+
+        let ack = blob
+            .lease_next_blob_write(next_callis_id())
+            .await
+            .expect("ack write");
+        assert!(matches!(
+            ack,
+            BlobWriteLease::Ack { peer_msg_id } if peer_msg_id == stream_id
+        ));
+        let err = blob
+            .lease_next_blob_write(next_callis_id())
+            .await
+            .expect("error write");
+        assert!(matches!(
+            err,
+            BlobWriteLease::Error { peer_msg_id, .. } if peer_msg_id == stream_id + 1
+        ));
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_complete_for_inactive_outbound_stream_is_protocol_violation() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = new_blob_manager();
+        let err = blob
+            .handle_complete(77)
+            .await
+            .expect_err("inactive complete rejected");
+        assert_eq!(err.kind, ErrorId::ProtocolViolation);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_callis_generation_bumps_on_add_remove_and_drain() {
+    let blob = new_blob_manager();
     let settings = BlobCallisSettings {
         chunk_size: 4,
         ack_window_chunks: 4,
     };
+
+    let mut add_rx = blob.subscribe_callis_gen();
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let callis_id = next_callis_id();
     blob.add_callis(
         CallisHandle {
             id: callis_id,
-            tx,
+            tx: CallisTx::Blob,
             shutdown: shutdown_tx,
-            available,
         },
         settings,
         true,
     )
     .await;
-
-    assert!(blob.take_available_callis().await.is_none());
-    assert!(!blob.has_callis().await);
-}
-
-#[tokio::test]
-async fn blob_reassigns_streams_on_callis_removal() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let settings = BlobCallisSettings {
-        chunk_size: 4,
-        ack_window_chunks: 4,
-    };
-
-    let (tx1, _rx1) = mpsc::channel(8);
-    let (shutdown_tx1, _shutdown_rx1) = watch::channel(false);
-    let callis_id1 = next_callis_id();
-    let available1 = Arc::new(AtomicBool::new(true));
-    blob.add_callis(
-        CallisHandle {
-            id: callis_id1,
-            tx: tx1,
-            shutdown: shutdown_tx1,
-            available: Arc::clone(&available1),
-        },
-        settings,
-        true,
-    )
-    .await;
-
-    let (tx2, mut rx2) = mpsc::channel(8);
-    let (shutdown_tx2, _shutdown_rx2) = watch::channel(false);
-    let callis_id2 = next_callis_id();
-    let available2 = Arc::new(AtomicBool::new(true));
-    blob.add_callis(
-        CallisHandle {
-            id: callis_id2,
-            tx: tx2,
-            shutdown: shutdown_tx2,
-            available: Arc::clone(&available2),
-        },
-        settings,
-        true,
-    )
-    .await;
-
-    let stream_id = 501;
-    let _ring = blob
-        .register_outbound_stream(stream_id, callis_id1, settings)
+    timeout(Duration::from_secs(1), add_rx.changed())
         .await
-        .expect("ring");
-    let frame = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_START,
-        peer_msg_id: 55,
-        payload: Bytes::new(),
-    };
-    blob.retain_frame(stream_id, 55, RetainedBlobKind::Start, frame.clone())
+        .expect("add generation timeout")
+        .expect("add generation");
+
+    let mut remove_rx = blob.subscribe_callis_gen();
+    let _handle = blob.remove_callis(callis_id).await;
+    timeout(Duration::from_secs(1), remove_rx.changed())
+        .await
+        .expect("remove generation timeout")
+        .expect("remove generation");
+
+    let mut drain_rx = blob.subscribe_callis_gen();
+    for _ in 0..2 {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        blob.add_callis(
+            CallisHandle {
+                id: next_callis_id(),
+                tx: CallisTx::Blob,
+                shutdown: shutdown_tx,
+            },
+            settings,
+            true,
+        )
         .await;
-
-    let _events_tx = spawn_blob_dispatcher(Arc::clone(&blob)).await;
-
-    let (_handle, streams) = blob.remove_callis(callis_id1).await;
-    blob.reassign_streams(streams).await;
-
-    let sent = timeout(Duration::from_secs(1), rx2.recv())
+    }
+    let _handles = blob.drain_callis().await;
+    timeout(Duration::from_secs(1), drain_rx.changed())
         .await
-        .expect("frame timeout")
-        .expect("frame");
-    assert!(matches!(
-        sent,
-        OutboundFrame::Control {
-            msg_type: MSG_BLOB_TRANSFER_START,
-            ..
-        }
-    ));
+        .expect("drain generation timeout")
+        .expect("drain generation");
 }
 
 #[tokio::test]
-async fn blob_replay_resends_retained_frames_in_order() {
-    let blob = Arc::new(BlobManager::new_for_tests());
-    let (tx_initial, _rx_initial) = mpsc::channel(8);
-    let (shutdown_tx_initial, _shutdown_rx_initial) = watch::channel(false);
+async fn blob_transmitter_writes_ring_chunk_without_writer_channel() {
+    let blob = Arc::new(new_blob_manager());
     let callis_id = next_callis_id();
-    let initial_available = Arc::new(AtomicBool::new(true));
-    let initial_handle = CallisHandle {
-        id: callis_id,
-        tx: tx_initial,
-        shutdown: shutdown_tx_initial,
-        available: Arc::clone(&initial_available),
-    };
     let settings = BlobCallisSettings {
-        chunk_size: 4,
+        chunk_size: 3,
         ack_window_chunks: 4,
     };
-
-    let stream_id = 5;
-    let start_frame = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_START,
-        peer_msg_id: 10,
-        payload: Bytes::new(),
-    };
-    let chunk0 = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_CHUNK,
-        peer_msg_id: 11,
-        payload: Bytes::from(
-            BlobTransferChunkPayload {
-                request_msg_id: stream_id,
-                chunk_id: 0,
-                flags: BlobChunkFlags::empty(),
-                chunk: Bytes::from_static(b"a"),
-            }
-            .to_bytes(),
-        ),
-    };
-    let chunk1 = OutboundFrame::Control {
-        msg_type: MSG_BLOB_TRANSFER_CHUNK,
-        peer_msg_id: 12,
-        payload: Bytes::from(
-            BlobTransferChunkPayload {
-                request_msg_id: stream_id,
-                chunk_id: 1,
-                flags: BlobChunkFlags::LAST_CHUNK,
-                chunk: Bytes::from_static(b"b"),
-            }
-            .to_bytes(),
-        ),
-    };
-
-    blob.retain_frame(
-        stream_id,
-        12,
-        RetainedBlobKind::Chunk { chunk_id: 1 },
-        chunk1.clone(),
-    )
-    .await;
-    blob.retain_frame(stream_id, 10, RetainedBlobKind::Start, start_frame.clone())
-        .await;
-    blob.retain_frame(
-        stream_id,
-        11,
-        RetainedBlobKind::Chunk { chunk_id: 0 },
-        chunk0.clone(),
-    )
-    .await;
-
-    blob.add_callis(initial_handle, settings, true).await;
-    let _ring = blob
-        .register_outbound_stream(stream_id, callis_id, settings)
+    let ring = blob
+        .register_outbound_stream(777, settings)
         .await
         .expect("ring");
-    let (_handle, _streams) = blob.remove_callis(callis_id).await;
+    ring.push_bytes(b"abcd", Duration::from_secs(1))
+        .await
+        .expect("push");
 
-    let (tx, mut rx) = mpsc::channel(8);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let resume_available = Arc::new(AtomicBool::new(true));
-    let resume_handle = CallisHandle {
-        id: next_callis_id(),
-        tx,
-        shutdown: shutdown_tx,
-        available: Arc::clone(&resume_available),
+    let (writer, mut reader) = tokio::io::duplex(1024);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
+    let (internal_shutdown_tx, _internal_shutdown_rx) = watch::channel(false);
+    let config = DomusConfigAccess::from_config(DomusConfig {
+        send_timeout: Duration::from_secs(1),
+        ..DomusConfig::default()
+    });
+    let blob_ref = Arc::clone(&blob);
+    let transmitter = tokio::spawn(async move {
+        let mut writer = writer;
+        crate::transport::callis::run_blob_transmitter(
+            config,
+            blob_ref,
+            callis_id,
+            &mut writer,
+            shutdown_rx,
+            writer_shutdown_rx,
+            internal_shutdown_tx,
+        )
+        .await;
+    });
+
+    blob.notify_work();
+    let mut frame_reader = crate::transport::frame::FrameReadState::default();
+    let (header, payload) = timeout(
+        Duration::from_secs(1),
+        frame_reader.read_next(&mut reader, 1024),
+    )
+    .await
+    .expect("read timeout")
+    .expect("read frame")
+    .expect("frame");
+    assert_eq!(header.msg_type, MSG_BLOB_TRANSFER_CHUNK);
+    let chunk = BlobTransferChunkPayload::from_bytes(&payload).expect("decode chunk");
+    assert_eq!(chunk.request_msg_id, 777);
+    assert_eq!(chunk.chunk_id, 0);
+    assert_eq!(chunk.chunk, Bytes::from_static(b"abc"));
+
+    let _ = shutdown_tx.send(true);
+    timeout(Duration::from_secs(1), transmitter)
+        .await
+        .expect("transmitter stop timeout")
+        .expect("transmitter join");
+}
+
+#[tokio::test]
+async fn blob_transmitter_writes_ack_without_writer_channel() {
+    let registry = Arc::new(TabernaRegistry::new());
+    let config = DomusConfigAccess::from_config(DomusConfig {
+        send_timeout: Duration::from_secs(1),
+        ..DomusConfig::default()
+    });
+    let handler_config = config.clone();
+    let session = Arc::new(PeerSession::new(
+        Arc::new(PeerMessageIdAllocator::default()),
+        config.clone(),
+        tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+    ));
+    session.set_active(true);
+
+    let blob = Arc::new(new_blob_manager());
+    let callis_id = next_callis_id();
+    let settings = BlobCallisSettings {
+        chunk_size: 3,
+        ack_window_chunks: 4,
     };
-    let _events_tx = spawn_blob_dispatcher(Arc::clone(&blob)).await;
-    blob.add_callis(resume_handle, settings, true).await;
+    let (shutdown_handle_tx, _shutdown_handle_rx) = watch::channel(false);
+    blob.add_callis(
+        CallisHandle {
+            id: callis_id,
+            tx: CallisTx::Blob,
+            shutdown: shutdown_handle_tx,
+        },
+        settings,
+        true,
+    )
+    .await;
 
-    let mut frames = Vec::new();
-    let notify = blob.dispatch_handle();
-    for _ in 0..3 {
-        if let Some(frame) = rx.recv().await {
-            frames.push(frame);
-            resume_available.store(true, Ordering::SeqCst);
-            notify.notify_one();
+    let mut receiver = start_stream(&blob, 901, settings).await;
+    let (writer, mut reader) = tokio::io::duplex(1024);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
+    let (internal_shutdown_tx, _internal_shutdown_rx) = watch::channel(false);
+    let blob_ref = Arc::clone(&blob);
+    let transmitter = tokio::spawn(async move {
+        let mut writer = writer;
+        crate::transport::callis::run_blob_transmitter(
+            config,
+            blob_ref,
+            callis_id,
+            &mut writer,
+            shutdown_rx,
+            writer_shutdown_rx,
+            internal_shutdown_tx,
+        )
+        .await;
+    });
+
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
+    let (cancel_tx, _cancel_rx) = watch::channel(CancelReason::None);
+    let payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+        request_msg_id: 901,
+        chunk_id: 0,
+        flags: BlobChunkFlags::LAST_CHUNK,
+        chunk: Bytes::from_static(b"abc"),
+    });
+    let header = WireHeader {
+        version: PROTOCOL_VERSION,
+        flags: 0,
+        msg_type: MSG_BLOB_TRANSFER_CHUNK,
+        peer_msg_id: 902,
+        src_taberna: 0,
+        dst_taberna: 0,
+        payload_len: payload.len() as u32,
+    };
+    let action = handle_inbound_frame(
+        registry,
+        Arc::clone(&session),
+        Arc::clone(&blob),
+        handler_config,
+        events_tx,
+        callis_id,
+        None,
+        header,
+        payload,
+        CancelReason::None,
+        Arc::new(Notify::new()),
+        &cancel_tx,
+    )
+    .await
+    .expect("handle inbound chunk");
+    assert!(matches!(action, InboundAction::None));
+
+    let mut frame_reader = crate::transport::frame::FrameReadState::default();
+    let (header, payload) = timeout(
+        Duration::from_secs(1),
+        frame_reader.read_next(&mut reader, 1024),
+    )
+    .await
+    .expect("read timeout")
+    .expect("read frame")
+    .expect("frame");
+    assert_eq!(header.msg_type, MSG_ACK);
+    assert_eq!(header.peer_msg_id, 902);
+    assert!(payload.is_empty());
+
+    use tokio::io::AsyncReadExt;
+    let mut data = Vec::new();
+    timeout(Duration::from_secs(1), receiver.read_to_end(&mut data))
+        .await
+        .expect("receiver read timeout")
+        .expect("receiver read");
+    assert_eq!(data, b"abc");
+
+    let _ = shutdown_tx.send(true);
+    timeout(Duration::from_secs(1), transmitter)
+        .await
+        .expect("transmitter stop timeout")
+        .expect("transmitter join");
+}
+
+#[tokio::test]
+async fn blob_transmitter_writes_error_without_writer_channel() {
+    let registry = Arc::new(TabernaRegistry::new());
+    let config = DomusConfigAccess::from_config(DomusConfig {
+        send_timeout: Duration::from_secs(1),
+        ..DomusConfig::default()
+    });
+    let handler_config = config.clone();
+    let session = Arc::new(PeerSession::new(
+        Arc::new(PeerMessageIdAllocator::default()),
+        config.clone(),
+        tokio::runtime::Handle::current(),
+        PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
+    ));
+    session.set_active(true);
+
+    let blob = Arc::new(new_blob_manager());
+    let callis_id = next_callis_id();
+    let settings = BlobCallisSettings {
+        chunk_size: 3,
+        ack_window_chunks: 4,
+    };
+    let (shutdown_handle_tx, _shutdown_handle_rx) = watch::channel(false);
+    blob.add_callis(
+        CallisHandle {
+            id: callis_id,
+            tx: CallisTx::Blob,
+            shutdown: shutdown_handle_tx,
+        },
+        settings,
+        true,
+    )
+    .await;
+    let _receiver = start_stream(&blob, 911, settings).await;
+
+    let (writer, mut reader) = tokio::io::duplex(1024);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
+    let (internal_shutdown_tx, _internal_shutdown_rx) = watch::channel(false);
+    let blob_ref = Arc::clone(&blob);
+    let transmitter = tokio::spawn(async move {
+        let mut writer = writer;
+        crate::transport::callis::run_blob_transmitter(
+            config,
+            blob_ref,
+            callis_id,
+            &mut writer,
+            shutdown_rx,
+            writer_shutdown_rx,
+            internal_shutdown_tx,
+        )
+        .await;
+    });
+
+    let (events_tx, _events_rx) = mpsc::channel::<PeerStateUpdate>(4);
+    let (cancel_tx, _cancel_rx) = watch::channel(CancelReason::None);
+    let payload = encode_blob_chunk_payload(&BlobTransferChunkPayload {
+        request_msg_id: 911,
+        chunk_id: 0,
+        flags: BlobChunkFlags::empty(),
+        chunk: Bytes::from_static(b"oversized"),
+    });
+    let header = WireHeader {
+        version: PROTOCOL_VERSION,
+        flags: 0,
+        msg_type: MSG_BLOB_TRANSFER_CHUNK,
+        peer_msg_id: 912,
+        src_taberna: 0,
+        dst_taberna: 0,
+        payload_len: payload.len() as u32,
+    };
+    let action = handle_inbound_frame(
+        registry,
+        Arc::clone(&session),
+        Arc::clone(&blob),
+        handler_config,
+        events_tx,
+        callis_id,
+        None,
+        header,
+        payload,
+        CancelReason::None,
+        Arc::new(Notify::new()),
+        &cancel_tx,
+    )
+    .await
+    .expect("handle inbound chunk");
+    assert!(matches!(action, InboundAction::None));
+
+    let mut frame_reader = crate::transport::frame::FrameReadState::default();
+    let (header, payload) = timeout(
+        Duration::from_secs(1),
+        frame_reader.read_next(&mut reader, 1024),
+    )
+    .await
+    .expect("read timeout")
+    .expect("read frame")
+    .expect("frame");
+    assert_eq!(header.msg_type, MSG_ERROR);
+    assert_eq!(header.peer_msg_id, 912);
+    let decoded = ErrorPayload::from_bytes(&payload).expect("error payload");
+    assert_eq!(decoded.error_id, ErrorId::ProtocolViolation.as_u32());
+
+    let _ = shutdown_tx.send(true);
+    timeout(Duration::from_secs(1), transmitter)
+        .await
+        .expect("transmitter stop timeout")
+        .expect("transmitter join");
+}
+
+#[tokio::test]
+async fn blob_transmitter_write_failure_replays_ring_slot() {
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write failed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
-    assert_eq!(frames.len(), 3);
-    assert!(matches!(
-        frames[0],
-        OutboundFrame::Control {
-            msg_type: MSG_BLOB_TRANSFER_START,
-            ..
-        }
-    ));
-    let first_chunk = match &frames[1] {
-        OutboundFrame::Control { payload, .. } => {
-            BlobTransferChunkPayload::from_bytes(payload).expect("decode")
-        }
-        _ => panic!("expected chunk frame"),
+
+    let blob = Arc::new(new_blob_manager());
+    let failed_callis = next_callis_id();
+    let retry_callis = next_callis_id();
+    let settings = BlobCallisSettings {
+        chunk_size: 3,
+        ack_window_chunks: 4,
     };
-    let second_chunk = match &frames[2] {
-        OutboundFrame::Control { payload, .. } => {
-            BlobTransferChunkPayload::from_bytes(payload).expect("decode")
-        }
-        _ => panic!("expected chunk frame"),
-    };
-    assert_eq!(first_chunk.chunk_id, 0);
-    assert_eq!(second_chunk.chunk_id, 1);
+    let ring = blob
+        .register_outbound_stream(778, settings)
+        .await
+        .expect("ring");
+    ring.push_bytes(b"abcd", Duration::from_secs(1))
+        .await
+        .expect("push");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (_writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
+    let (internal_shutdown_tx, internal_shutdown_rx) = watch::channel(false);
+    let config = DomusConfigAccess::from_config(DomusConfig {
+        send_timeout: Duration::from_secs(1),
+        ..DomusConfig::default()
+    });
+    let blob_ref = Arc::clone(&blob);
+    let transmitter = tokio::spawn(async move {
+        let mut writer = FailingWriter;
+        crate::transport::callis::run_blob_transmitter(
+            config,
+            blob_ref,
+            failed_callis,
+            &mut writer,
+            shutdown_rx,
+            writer_shutdown_rx,
+            internal_shutdown_tx,
+        )
+        .await;
+    });
+
+    blob.notify_work();
+    timeout(Duration::from_secs(1), transmitter)
+        .await
+        .expect("transmitter timeout")
+        .expect("transmitter join");
+    assert!(*internal_shutdown_rx.borrow());
+
+    let replay = blob
+        .lease_next_blob_write(retry_callis)
+        .await
+        .expect("replay lease");
+    let replay_chunk = leased_chunk(&replay);
+    assert_eq!(replay.stream_id(), Some(778));
+    assert_eq!(replay_chunk.chunk_id, 0);
+    assert_eq!(replay_chunk.data, Bytes::from_static(b"abc"));
+    assert_eq!(replay_chunk.callis_id, retry_callis);
+
+    let _ = shutdown_tx.send(true);
 }
 
 #[tokio::test]
-async fn blob_resume_false_clears_retained_frames() {
-    let blob = BlobManager::new_for_tests();
-    let (tx, _rx) = mpsc::channel(8);
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let callis_id = next_callis_id();
-    let available = Arc::new(AtomicBool::new(true));
-    let handle = CallisHandle {
-        id: callis_id,
-        tx,
-        shutdown: shutdown_tx,
-        available: Arc::clone(&available),
-    };
+async fn blob_chunk_wire_write_uses_leased_chunk_slice() {
+    struct RecordingWriter {
+        writes: Vec<(usize, usize)>,
+    }
 
-    blob.retain_frame(
-        1,
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.push((buf.len(), buf.as_ptr() as usize));
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let chunk = Bytes::from_static(b"leased-bytes");
+    let chunk_ptr = chunk.as_ptr() as usize;
+    let mut writer = RecordingWriter { writes: Vec::new() };
+
+    crate::transport::frame::send_blob_chunk_frame(
+        &mut writer,
+        44,
         55,
-        RetainedBlobKind::Start,
-        OutboundFrame::Control {
-            msg_type: MSG_BLOB_TRANSFER_START,
-            peer_msg_id: 55,
-            payload: Bytes::new(),
-        },
+        66,
+        BlobChunkFlags::LAST_CHUNK,
+        &chunk,
     )
-    .await;
+    .await
+    .expect("write chunk");
 
-    let settings = BlobCallisSettings {
-        chunk_size: 4,
-        ack_window_chunks: 4,
-    };
-    blob.add_callis(handle, settings, false).await;
+    assert_eq!(writer.writes.len(), 3);
+    assert_eq!(writer.writes[1].0, BlobTransferChunkPayload::HEADER_LEN);
+    assert_eq!(writer.writes[2], (chunk.len(), chunk_ptr));
+}
 
-    let retained = blob.retained.lock().await;
-    assert!(retained.is_empty());
+#[tokio::test]
+async fn blob_write_lease_installs_inflight_before_write_completion() {
+    let blob = Arc::new(new_blob_manager());
+    let callis_id = next_callis_id();
+    let settings = blob_settings(3, 1);
+    let ring = blob
+        .register_outbound_stream(778, settings)
+        .await
+        .expect("ring");
+    ring.push_bytes(b"abcd", Duration::from_secs(1))
+        .await
+        .expect("push");
+
+    let dispatch = blob
+        .lease_next_blob_write(callis_id)
+        .await
+        .expect("dispatch");
+    assert!(dispatch.is_chunk());
+    assert_eq!(ring.inflight_chunk_count().await, 1);
+
+    blob.handle_ack(dispatch.peer_msg_id()).await;
+    assert_eq!(ring.inflight_chunk_count().await, 0);
+    blob.finish_blob_write_attempt(&dispatch, callis_id, Ok(()))
+        .await;
+
+    timeout(
+        Duration::from_secs(1),
+        ring.push_bytes(b"ef", Duration::from_secs(1)),
+    )
+    .await
+    .expect("capacity should be released")
+    .expect("push after fast ack");
+}
+
+#[tokio::test]
+async fn blob_sender_poll_write_returns_bounded_partial_progress() {
+    let blob = Arc::new(new_blob_manager());
+    let stream_id = 7790;
+    let settings = blob_settings(4, 1);
+    let ring = blob
+        .register_outbound_stream(stream_id, settings)
+        .await
+        .expect("ring");
+    let mut sender = BlobSenderStream::new(
+        Arc::clone(&blob),
+        stream_id,
+        ring,
+        Duration::from_secs(1),
+        tokio::runtime::Handle::current(),
+    );
+
+    use tokio::io::AsyncWriteExt;
+    let accepted = timeout(Duration::from_secs(1), sender.write(b"abcdefghij"))
+        .await
+        .expect("write timeout")
+        .expect("write");
+    assert!(accepted > 0);
+    assert!(accepted < 10);
+}
+
+#[tokio::test]
+async fn blob_write_failure_replays_chunk_from_ring_slot() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let callis_id = next_callis_id();
+        let settings = blob_settings(3, 1);
+        let ring = blob
+            .register_outbound_stream(779, settings)
+            .await
+            .expect("ring");
+        ring.push_bytes(b"abcd", Duration::from_secs(1))
+            .await
+            .expect("push");
+
+        let first = blob
+            .lease_next_blob_write(callis_id)
+            .await
+            .expect("first dispatch");
+        let first_lease = leased_chunk(&first).clone();
+        blob.finish_blob_write_attempt(
+            &first,
+            callis_id,
+            Err(AureliaError::new(ErrorId::PeerUnavailable)),
+        )
+        .await;
+
+        let replay = blob
+            .lease_next_blob_write(callis_id)
+            .await
+            .expect("replay dispatch");
+        let replay_lease = leased_chunk(&replay).clone();
+        assert_eq!(replay_lease.chunk_id, first_lease.chunk_id);
+        assert_eq!(replay_lease.data.as_ptr(), first_lease.data.as_ptr());
+        assert!(replay_lease.slot_seq > first_lease.slot_seq);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_leasing_is_not_bound_to_stream_callis_assignment() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let first_callis = next_callis_id();
+        let second_callis = next_callis_id();
+        let settings = blob_settings(3, 4);
+        let ring = blob
+            .register_outbound_stream(780, settings)
+            .await
+            .expect("ring");
+        ring.push_bytes(b"abcdef", Duration::from_secs(1))
+            .await
+            .expect("push");
+        ring.seal(Duration::from_secs(1)).await.expect("seal");
+
+        let first = blob
+            .lease_next_blob_write(first_callis)
+            .await
+            .expect("first dispatch");
+        let second = blob
+            .lease_next_blob_write(second_callis)
+            .await
+            .expect("second dispatch");
+
+        let first_lease = leased_chunk(&first);
+        let second_lease = leased_chunk(&second);
+        assert_eq!(first_lease.chunk_id, 0);
+        assert_eq!(first_lease.callis_id, first_callis);
+        assert_eq!(second_lease.chunk_id, 1);
+        assert_eq!(second_lease.callis_id, second_callis);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_callis_loss_replays_only_slots_written_on_that_callis() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let failed_callis = next_callis_id();
+        let live_callis = next_callis_id();
+        let settings = blob_settings(3, 4);
+        let ring = blob
+            .register_outbound_stream(781, settings)
+            .await
+            .expect("ring");
+        ring.push_bytes(b"abcdef", Duration::from_secs(1))
+            .await
+            .expect("push");
+        ring.seal(Duration::from_secs(1)).await.expect("seal");
+
+        let first = blob
+            .lease_next_blob_write(failed_callis)
+            .await
+            .expect("first dispatch");
+        let second = blob
+            .lease_next_blob_write(live_callis)
+            .await
+            .expect("second dispatch");
+        assert_eq!(leased_chunk(&first).chunk_id, 0);
+        assert_eq!(leased_chunk(&second).chunk_id, 1);
+
+        blob.requeue_inflight_for_callis(failed_callis).await;
+        let replay = blob
+            .lease_next_blob_write(live_callis)
+            .await
+            .expect("replay dispatch");
+        let replay_lease = leased_chunk(&replay);
+        assert_eq!(replay_lease.chunk_id, 0);
+        assert_eq!(replay_lease.callis_id, live_callis);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_stream_leasing_uses_round_robin_and_prefers_replay() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let callis_id = next_callis_id();
+        let settings = blob_settings(1, 4);
+        for stream_id in [820, 821, 822] {
+            let ring = blob
+                .register_outbound_stream(stream_id, settings)
+                .await
+                .expect("ring");
+            ring.push_bytes(b"x", Duration::from_secs(1))
+                .await
+                .expect("push");
+            ring.seal(Duration::from_secs(1)).await.expect("seal");
+        }
+
+        let first = blob.lease_next_blob_write(callis_id).await.expect("first");
+        let second = blob.lease_next_blob_write(callis_id).await.expect("second");
+        let third = blob.lease_next_blob_write(callis_id).await.expect("third");
+        assert_eq!(first.stream_id(), Some(820));
+        assert_eq!(second.stream_id(), Some(821));
+        assert_eq!(third.stream_id(), Some(822));
+
+        blob.finish_blob_write_attempt(
+            &second,
+            callis_id,
+            Err(AureliaError::new(ErrorId::PeerUnavailable)),
+        )
+        .await;
+        let replay = blob.lease_next_blob_write(callis_id).await.expect("replay");
+        assert_eq!(replay.stream_id(), Some(821));
+        assert_eq!(
+            leased_chunk(&replay).chunk_id,
+            leased_chunk(&second).chunk_id
+        );
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_round_robin_rotates_across_ready_streams() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let callis_id = next_callis_id();
+        let settings = blob_settings(1, 2);
+
+        let busy = blob
+            .register_outbound_stream(840, settings)
+            .await
+            .expect("busy ring");
+        busy.push_bytes(b"ab", Duration::from_secs(1))
+            .await
+            .expect("push busy");
+        busy.seal(Duration::from_secs(1)).await.expect("seal busy");
+
+        let sibling = blob
+            .register_outbound_stream(841, settings)
+            .await
+            .expect("sibling ring");
+        sibling
+            .push_bytes(b"x", Duration::from_secs(1))
+            .await
+            .expect("push sibling");
+        sibling
+            .seal(Duration::from_secs(1))
+            .await
+            .expect("seal sibling");
+
+        let first = blob.lease_next_blob_write(callis_id).await.expect("first");
+        let second = blob.lease_next_blob_write(callis_id).await.expect("second");
+        let third = blob.lease_next_blob_write(callis_id).await.expect("third");
+
+        assert_eq!(first.stream_id(), Some(840));
+        assert_eq!(second.stream_id(), Some(841));
+        assert_eq!(third.stream_id(), Some(840));
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_multiple_transmitters_do_not_receive_duplicate_chunk_leases() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let settings = blob_settings(1, 4);
+        let ring = blob
+            .register_outbound_stream(850, settings)
+            .await
+            .expect("ring");
+        ring.push_bytes(b"abcd", Duration::from_secs(1))
+            .await
+            .expect("push");
+        ring.seal(Duration::from_secs(1)).await.expect("seal");
+
+        let first_callis = next_callis_id();
+        let second_callis = next_callis_id();
+        let first_blob = Arc::clone(&blob);
+        let second_blob = Arc::clone(&blob);
+        let (first, second) = tokio::join!(
+            first_blob.lease_next_blob_write(first_callis),
+            second_blob.lease_next_blob_write(second_callis),
+        );
+
+        let first = first.expect("first lease");
+        let second = second.expect("second lease");
+        let first_chunk = leased_chunk(&first);
+        let second_chunk = leased_chunk(&second);
+        assert_eq!(first.stream_id(), Some(850));
+        assert_eq!(second.stream_id(), Some(850));
+        assert_ne!(first_chunk.chunk_id, second_chunk.chunk_id);
+        assert_eq!(first_chunk.callis_id, first_callis);
+        assert_eq!(second_chunk.callis_id, second_callis);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_pull_scan_skips_stream_without_ready_chunk() {
+    tokio::time::timeout(BLOB_MANAGER_TEST_TIMEOUT, async {
+        let blob = Arc::new(new_blob_manager());
+        let settings = blob_settings(1, 4);
+        for stream_id in [860, 861] {
+            let ring = blob
+                .register_outbound_stream(stream_id, settings)
+                .await
+                .expect("ring");
+            ring.push_bytes(b"x", Duration::from_secs(1))
+                .await
+                .expect("push");
+            ring.seal(Duration::from_secs(1)).await.expect("seal");
+        }
+
+        let slow_callis = next_callis_id();
+        let other_callis = next_callis_id();
+        let slow = blob
+            .lease_next_blob_write(slow_callis)
+            .await
+            .expect("slow lease");
+        let other = blob
+            .lease_next_blob_write(other_callis)
+            .await
+            .expect("other lease");
+
+        assert_eq!(slow.stream_id(), Some(860));
+        assert_eq!(leased_chunk(&slow).callis_id, slow_callis);
+        assert_eq!(other.stream_id(), Some(861));
+        assert_eq!(leased_chunk(&other).callis_id, other_callis);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn blob_leasing_wakes_another_transmitter_when_more_work_remains() {
+    let blob = Arc::new(new_blob_manager());
+    let settings = blob_settings(1, 4);
+    for stream_id in [870, 871] {
+        let ring = blob
+            .register_outbound_stream(stream_id, settings)
+            .await
+            .expect("ring");
+        ring.push_bytes(b"x", Duration::from_secs(1))
+            .await
+            .expect("push");
+        ring.seal(Duration::from_secs(1)).await.expect("seal");
+    }
+
+    let work = blob.work_handle();
+    let waiter = work.notified();
+    tokio::pin!(waiter);
+
+    let first = blob
+        .lease_next_blob_write(next_callis_id())
+        .await
+        .expect("first lease");
+    assert_eq!(first.stream_id(), Some(870));
+    timeout(Duration::from_secs(1), &mut waiter)
+        .await
+        .expect("more work notification");
 }
 
 #[tokio::test]
@@ -1180,16 +1912,12 @@ async fn blob_callis_missing_settings_is_closed() {
         listener_shutdown_tx,
         tokio::runtime::Handle::current(),
     );
-
-    let (tx, mut rx) = mpsc::channel(8);
-    let (callis_shutdown_tx, _callis_shutdown_rx) = watch::channel(false);
-    let available = Arc::new(AtomicBool::new(true));
+    let (callis_shutdown_tx, mut callis_shutdown_rx) = watch::channel(false);
     let info = ConnectionInfo {
         handle: CallisHandle {
             id: next_callis_id(),
-            tx,
+            tx: CallisTx::Blob,
             shutdown: callis_shutdown_tx,
-            available,
         },
         replay: Vec::new(),
         fresh_session: false,
@@ -1206,17 +1934,17 @@ async fn blob_callis_missing_settings_is_closed() {
         .await
         .expect("send connected");
 
-    let frame = timeout(Duration::from_secs(1), rx.recv())
+    timeout(Duration::from_secs(1), callis_shutdown_rx.changed())
         .await
         .expect("close timeout")
-        .expect("close frame");
-    assert!(matches!(frame, OutboundFrame::Close));
+        .expect("shutdown signal");
+    assert!(*callis_shutdown_rx.borrow());
 }
 
 #[test]
 fn blob_receiver_drop_cleans_up_without_runtime() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let blob = Arc::new(BlobManager::new_for_tests());
+    let blob = Arc::new(new_blob_manager());
     let stream_id: PeerMessageId = 11;
     let state = Arc::new(BlobReceiverState {
         notify: Arc::new(Notify::new()),
@@ -1256,14 +1984,14 @@ fn blob_receiver_drop_cleans_up_without_runtime() {
 #[test]
 fn blob_sender_drop_cleans_up_without_runtime() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let blob = Arc::new(BlobManager::new_for_tests());
+    let blob = Arc::new(new_blob_manager());
     let stream_id: PeerMessageId = 21;
     let settings = BlobCallisSettings {
         chunk_size: 4,
         ack_window_chunks: 4,
     };
     let ring = runtime
-        .block_on(async { blob.register_outbound_stream(stream_id, 1, settings).await })
+        .block_on(async { blob.register_outbound_stream(stream_id, settings).await })
         .expect("ring");
     let sender = BlobSenderStream::new(
         Arc::clone(&blob),

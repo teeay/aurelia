@@ -12,5 +12,11 @@ if [[ -z "$timeout_bin" ]]; then
 fi
 
 suite_timeout_secs="${AURELIA_TEST_SUITE_TIMEOUT_SECS:-600}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-exec "$timeout_bin" "${suite_timeout_secs}s" cargo test
+exec "$timeout_bin" "${suite_timeout_secs}s" bash -c '
+set -euo pipefail
+repo_root="$1"
+"$repo_root/scripts/testing/check-async-test-timeouts.py"
+cargo test
+' bash "$repo_root"

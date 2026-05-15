@@ -65,7 +65,6 @@ The following message types are reserved for transport control and are defined i
 - ack
 - close
 - error
-- blob-transfer-start
 - blob-transfer-chunk
 - blob-transfer-complete
 
@@ -115,16 +114,12 @@ Blob transfers are initiated by an application message on the primary callis and
 
 Message types:
 
-- `blob-transfer-start`
 - `blob-transfer-chunk`
 - `blob-transfer-complete`
 
 Payloads (byte layout after the standard header):
 
 ```text
-blob-transfer-start:
-u32 request_msg_id
-
 blob-transfer-chunk:
 u32 request_msg_id
 u64 chunk_id
@@ -157,6 +152,8 @@ struct ErrorPayload {
 ```
 
 Error IDs are defined in `docs/ids.md`.
+Receivers must reject unknown `error_id` values as `protocol-violation` and include the raw ID in
+local diagnostics. Unknown inbound error IDs must not be coerced to `peer-unavailable`.
 
 `blob-stream-missing-chunk` error payload requirements:
 
@@ -173,6 +170,9 @@ Error IDs are defined in `docs/ids.md`.
 - Payload length must match the frame body size.
 - Reserved message types are handled by transport control handlers only.
 - Payload length must not exceed the configured maximum (`DomusConfig::max_payload_len`, default 8 MiB).
+- Public application sends enforce the same payload maximum before local delivery or remote
+  routing. The outbound path must also reject payload lengths that cannot be represented in the
+  `u32` wire header.
 
 <!--
 This file is part of the Aurelia workspace.

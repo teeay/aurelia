@@ -4,20 +4,16 @@
 
 use std::sync::Arc;
 
-use tokio::time::timeout;
-use tracing::{debug, warn};
-
-use crate::address::DomusAddr;
 use crate::config::DomusConfigAccess;
-use crate::routing::RouteResolver;
-use crate::taberna::{TabernaInbox, TabernaRegistry};
+use crate::taberna::TabernaRegistry;
 use crate::transport::{BlobBufferTracker, Transport, TransportBackend, TransportBackendImpl};
-use aurelia_ids::{AureliaError, ErrorId, MessageType, TabernaId};
+use aurelia_data::DomusAddr;
+use aurelia_data::RouteResolver;
 
-mod builder;
 mod dispatch;
 
-pub use builder::RouteLocalRemoteBuilder;
+#[cfg(test)]
+pub(crate) use dispatch::validate_app_send;
 
 #[derive(Clone)]
 pub struct RouteLocalRemote<RR, B = TransportBackendImpl>
@@ -32,47 +28,24 @@ where
     pub(crate) config: DomusConfigAccess,
 }
 
-pub(super) struct DispatchLogs {
-    pub(super) local: &'static str,
-    pub(super) resolve_failed: &'static str,
-    pub(super) resolve_timeout: &'static str,
-    pub(super) remote: &'static str,
-}
-
-pub(super) enum DispatchTarget {
-    Local(Arc<dyn TabernaInbox>),
-    Remote(DomusAddr),
-}
-
-pub(super) async fn resolve_dispatch_target<RR>(
-    registry: &TabernaRegistry,
-    resolver: &RR,
-    config: &DomusConfigAccess,
-    taberna_id: TabernaId,
-    msg_type: MessageType,
-    logs: DispatchLogs,
-) -> Result<DispatchTarget, AureliaError>
+impl<RR, B> RouteLocalRemote<RR, B>
 where
-    RR: RouteResolver + ?Sized,
+    RR: RouteResolver,
+    B: TransportBackend<Addr = DomusAddr> + 'static,
 {
-    if let Some(sink) = registry.resolve_local(taberna_id).await {
-        debug!(taberna_id, msg_type, "{}", logs.local);
-        return Ok(DispatchTarget::Local(sink));
+    pub(crate) fn new(
+        config: DomusConfigAccess,
+        registry: Arc<TabernaRegistry>,
+        resolver: Arc<RR>,
+        transport: Arc<Transport<B>>,
+    ) -> Self {
+        let blob_buffers = transport.blob_buffers();
+        Self {
+            registry,
+            resolver,
+            transport,
+            blob_buffers,
+            config,
+        }
     }
-
-    let config = config.snapshot().await;
-    let resolve = resolver.resolve(taberna_id);
-    let peer = match timeout(config.send_timeout, resolve).await {
-        Ok(Ok(peer)) => peer,
-        Ok(Err(err)) => {
-            warn!(taberna_id, msg_type, error = %err, "{}", logs.resolve_failed);
-            return Err(err);
-        }
-        Err(_) => {
-            warn!(taberna_id, msg_type, "{}", logs.resolve_timeout);
-            return Err(AureliaError::new(ErrorId::SendTimeout));
-        }
-    };
-    debug!(taberna_id, msg_type, peer = %peer, "{}", logs.remote);
-    Ok(DispatchTarget::Remote(peer))
 }

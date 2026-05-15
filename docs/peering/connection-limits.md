@@ -10,6 +10,14 @@ Status: Developed
 
 ## Technical Details
 
+### Per-Callis A0 Admission
+
+A0 admission limits apply to the complete transport authentication path for every inbound callis.
+Socket and TCP callis that arrive after an existing peer session is live still consume an A0
+pre-authentication slot and must complete the same connect-back validation path as the first callis
+before they are released to A1. Unexpected A0 protocol input is rejected while the A0 slot is held;
+the slot is released on failure and the stream is not converted into an A1 handshake.
+
 ### A0 Pre-Authentication Admission Control
 
 - Admission applies **before transport authentication** begins and **before** any A1 `hello` frames.
@@ -40,7 +48,7 @@ Status: Developed
 - Accept inbound socket connection.
 - Immediately attempt to acquire the global A0 handshake slot.
 - If no slot is available, close the stream before any auth frames are read and return `PeerUnavailable`.
-- If a slot is available, proceed with socket auth handshake (connect-back or resume).
+- If a slot is available, proceed with socket connect-back authentication.
 - Release the slot on success, failure, or timeout.
 
 ### Distinguishing Handshakes From Full Connections

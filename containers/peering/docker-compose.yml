@@ -4,10 +4,13 @@
 
 services:
   domus-1:
-    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus"
+    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus:${AURELIA_E2E_IMAGE_VERSION:-local}"
     build:
       context: ../..
       dockerfile: containers/peering/Dockerfile.domus
+      args:
+        AURELIA_E2E_BUILDER_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-builder-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
+        AURELIA_E2E_RUNTIME_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-runtime-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
     environment:
       DOMUS_INDEX: "1"
       PRIMARY_ADDR: "0.0.0.0:5000"
@@ -17,6 +20,7 @@ services:
       DOMUS_KEY: "/certs/domus/domus-1/key.pem"
       LISTENER_DELAY_MS: "0"
       LISTENER_RECONNECT_TIMEOUT_MS: "1000"
+      TABERNA_ACCEPT_QUEUE_SIZE: "8"
       OOB_CONTROL_PORT: "${AURELIA_E2E_OOB_CONTROL_PORT:-5001}"
       RUST_LOG: "${AURELIA_E2E_DOMUS_LOG:-info}"
     volumes:
@@ -29,10 +33,13 @@ services:
         ipv4_address: ${AURELIA_E2E_DOMUS_1_IP:-172.30.0.11}
 
   domus-2:
-    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus"
+    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus:${AURELIA_E2E_IMAGE_VERSION:-local}"
     build:
       context: ../..
       dockerfile: containers/peering/Dockerfile.domus
+      args:
+        AURELIA_E2E_BUILDER_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-builder-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
+        AURELIA_E2E_RUNTIME_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-runtime-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
     environment:
       DOMUS_INDEX: "2"
       PRIMARY_ADDR: "0.0.0.0:5000"
@@ -42,6 +49,7 @@ services:
       DOMUS_KEY: "/certs/domus/domus-2/key.pem"
       LISTENER_DELAY_MS: "0"
       LISTENER_RECONNECT_TIMEOUT_MS: "1000"
+      TABERNA_ACCEPT_QUEUE_SIZE: "8"
       OOB_CONTROL_PORT: "${AURELIA_E2E_OOB_CONTROL_PORT:-5001}"
       RUST_LOG: "${AURELIA_E2E_DOMUS_LOG:-info}"
     volumes:
@@ -54,10 +62,13 @@ services:
         ipv4_address: ${AURELIA_E2E_DOMUS_2_IP:-172.30.0.12}
 
   domus-3:
-    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus"
+    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-domus:${AURELIA_E2E_IMAGE_VERSION:-local}"
     build:
       context: ../..
       dockerfile: containers/peering/Dockerfile.domus
+      args:
+        AURELIA_E2E_BUILDER_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-builder-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
+        AURELIA_E2E_RUNTIME_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-runtime-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
     environment:
       DOMUS_INDEX: "3"
       PRIMARY_ADDR: "0.0.0.0:5000"
@@ -67,6 +78,7 @@ services:
       DOMUS_KEY: "/certs/domus/domus-3/key.pem"
       LISTENER_DELAY_MS: "0"
       LISTENER_RECONNECT_TIMEOUT_MS: "1000"
+      TABERNA_ACCEPT_QUEUE_SIZE: "8"
       OOB_CONTROL_PORT: "${AURELIA_E2E_OOB_CONTROL_PORT:-5001}"
       RUST_LOG: "${AURELIA_E2E_DOMUS_LOG:-info}"
     volumes:
@@ -79,10 +91,13 @@ services:
         ipv4_address: ${AURELIA_E2E_DOMUS_3_IP:-172.30.0.13}
 
   driver:
-    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-driver"
+    image: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-driver:${AURELIA_E2E_IMAGE_VERSION:-local}"
     build:
       context: ../..
       dockerfile: containers/peering/Dockerfile.driver
+      args:
+        AURELIA_E2E_BUILDER_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-builder-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
+        AURELIA_E2E_RUNTIME_BASE: "aurelia-${AURELIA_E2E_IMAGE_TAG:-e2e}-runtime-base:${AURELIA_E2E_IMAGE_VERSION:-local}"
     environment:
       PRIMARY_ADDR: "0.0.0.0:5000"
       PRIMARY_PORT: "5000"

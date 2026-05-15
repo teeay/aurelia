@@ -40,21 +40,6 @@ impl TransportBackend for TestBackend {
     }
 }
 
-type TestPeerEvent = PeerStateUpdate;
-
-async fn spawn_blob_dispatcher(blob: Arc<BlobManager>) -> mpsc::Sender<TestPeerEvent> {
-    let (events_tx, _events_rx) = mpsc::channel(8);
-    let notify = blob.dispatch_handle();
-    let dispatch_tx = events_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            notify.notified().await;
-            dispatch_blob(&blob, &dispatch_tx, &notify).await;
-        }
-    });
-    events_tx
-}
-
 struct RecordingSink {
     received: Mutex<Vec<(MessageType, Bytes, Option<crate::BlobReceiver>)>>,
     expected_msg_types: Vec<MessageType>,
@@ -83,9 +68,11 @@ impl TabernaInbox for RecordingSink {
         blob_receiver: Option<crate::BlobReceiver>,
         notify: Option<Arc<Notify>>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(), AureliaError>>, AureliaError> {
-        if !self.expected_msg_types.contains(&msg_type) {
-            return Err(AureliaError::new(ErrorId::RemoteTabernaRejected));
-        }
+        assert!(
+            self.expected_msg_types.contains(&msg_type),
+            "unexpected msg_type {msg_type}; expected one of {:?}",
+            self.expected_msg_types
+        );
         self.received
             .lock()
             .await
@@ -99,6 +86,7 @@ impl TabernaInbox for RecordingSink {
     }
 }
 
+mod auth;
 mod backend;
 mod blob;
 mod callis;

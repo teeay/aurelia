@@ -92,6 +92,7 @@ impl PublishConfig {
                 self.target_crate
             );
         }
+        validate_excluded_crates(&self.excluded_crates, &workspace_members)?;
 
         for ic in &self.internal_crates {
             let pkg = metadata
@@ -120,6 +121,21 @@ impl PublishConfig {
     }
 }
 
+fn validate_excluded_crates(
+    excluded_crates: &[String],
+    workspace_members: &[String],
+) -> Result<()> {
+    for excluded in excluded_crates {
+        if !workspace_members.iter().any(|member| member == excluded) {
+            bail!(
+                "excluded_crates entry `{}` is not a workspace member",
+                excluded
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn default_module(crate_name: &str) -> String {
     crate_name
         .strip_prefix("aurelia-")
@@ -128,14 +144,5 @@ pub fn default_module(crate_name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_module_strips_prefix_and_dashes() {
-        assert_eq!(default_module("aurelia-peering"), "peering");
-        assert_eq!(default_module("aurelia-foo-bar"), "foo_bar");
-        assert_eq!(default_module("standalone"), "standalone");
-        assert_eq!(default_module("aurelia-ids"), "ids");
-    }
-}
+#[path = "tests/config.rs"]
+mod tests;

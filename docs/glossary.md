@@ -120,11 +120,15 @@ Confirmation from the remote peer that a message identified by peer message ID w
 
 ### Inflight message
 
-A sent but not yet ACKed message retained by the sender for possible replay.
+A sent but not yet ACKed message retained by A1 for possible replay. Dropping the local sender-side
+wait interest leaves accepted transport work retained until transport completion.
 
 ### Outbound queue
 
-A bounded queue of messages awaiting transmission to a peer, typically tracked per callis and/or per peer.
+A bounded queue of messages awaiting transmission to a peer. For primary traffic, queued ownership
+belongs to A1 once the message is accepted into dispatch. A3 queue saturation rejects new
+application sends immediately with `local-queue-full`; it does not create a hidden sender-side wait
+queue.
 
 ### Dedupe
 

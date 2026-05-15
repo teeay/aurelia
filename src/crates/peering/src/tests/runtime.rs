@@ -6,13 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::message_id::PeerMessageIdAllocator;
-use crate::session::{BackpressureConfig, PeerSession};
+use crate::session::PeerSession;
 use crate::taberna::{Taberna, TabernaInboxHandle, TabernaRegistry};
+use crate::transport::primary_dispatch::PrimaryDispatchManager;
 use crate::{DomusConfigAccess, DomusConfigBuilder};
 use aurelia_ids::ErrorId;
-use caducus::MpscBuilder;
+use caducus::{CaducusErrorKind, MpscBuilder};
 
 use super::TestCodec;
+
+const RUNTIME_ASYNC_TEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[test]
 fn taberna_drop_unregisters_without_runtime() {
@@ -64,19 +67,14 @@ fn taberna_drop_unregisters_without_runtime() {
 }
 
 #[test]
-fn ack_waiter_drop_releases_queue_without_runtime() {
+fn ack_waiter_drop_does_not_release_queue_without_runtime() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let session = runtime.block_on(async {
-        let config = BackpressureConfig {
-            send_queue_size: 1,
-            inflight_window: 1,
-            send_timeout: Duration::from_millis(25),
-        };
         let domus_config = DomusConfigBuilder::new()
-            .send_queue_size(config.send_queue_size)
-            .inflight_window(config.inflight_window)
-            .send_timeout(config.send_timeout)
-            .accept_timeout(config.send_timeout)
+            .send_queue_size(1)
+            .send_timeout(Duration::from_millis(25))
+            .callis_connect_timeout(Duration::from_millis(25))
+            .accept_timeout(Duration::from_millis(25))
             .build()
             .expect("valid domus config");
         let store: DomusConfigAccess = DomusConfigAccess::from_config(domus_config);
@@ -84,12 +82,19 @@ fn ack_waiter_drop_releases_queue_without_runtime() {
             Arc::new(PeerMessageIdAllocator::default()),
             store,
             tokio::runtime::Handle::current(),
+            PrimaryDispatchManager::new_for_tests(tokio::runtime::Handle::current()),
         )
     });
 
     let waiter = runtime.block_on(async {
         let (_message, waiter) = session
-            .create_outgoing(1u64, 2u64, 1u32, 0, bytes::Bytes::from_static(b"a"))
+            .create_outgoing(
+                1u64,
+                2u64,
+                crate::a3_message_type(0),
+                0,
+                bytes::Bytes::from_static(b"a"),
+            )
             .await
             .expect("enqueue");
         waiter
@@ -98,12 +103,60 @@ fn ack_waiter_drop_releases_queue_without_runtime() {
     drop(waiter);
 
     runtime.block_on(async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let _next = session
-            .create_outgoing(1u64, 2u64, 1u32, 0, bytes::Bytes::from_static(b"b"))
+        let err = match session
+            .create_outgoing(
+                1u64,
+                2u64,
+                crate::a3_message_type(0),
+                0,
+                bytes::Bytes::from_static(b"b"),
+            )
             .await
-            .expect("queue released after drop");
+        {
+            Ok(_) => panic!("dropped waiter must not recall queued work"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind, ErrorId::LocalQueueFull);
     });
+}
+
+#[tokio::test]
+async fn caducus_send_with_deadline_accepts_future_deadline() {
+    tokio::time::timeout(RUNTIME_ASYNC_TEST_TIMEOUT, async {
+        let (sender, receiver) = MpscBuilder::<u64>::new(1, Duration::from_secs(1))
+            .runtime(tokio::runtime::Handle::current())
+            .build()
+            .expect("caducus build");
+
+        sender
+            .send_with_deadline(7, std::time::Instant::now() + Duration::from_secs(1))
+            .expect("future deadline accepted");
+
+        let item = receiver
+            .next(Some(std::time::Instant::now() + Duration::from_millis(50)))
+            .await
+            .expect("item received");
+        assert_eq!(item, 7);
+    })
+    .await
+    .expect("async test timed out");
+}
+
+#[tokio::test]
+async fn caducus_send_with_deadline_rejects_expired_deadline() {
+    tokio::time::timeout(RUNTIME_ASYNC_TEST_TIMEOUT, async {
+        let (sender, _receiver) = MpscBuilder::<u64>::new(1, Duration::from_secs(1))
+            .runtime(tokio::runtime::Handle::current())
+            .build()
+            .expect("caducus build");
+
+        let err = sender
+            .send_with_deadline(7, std::time::Instant::now())
+            .expect_err("expired deadline rejected");
+        assert!(matches!(err.kind, CaducusErrorKind::InvalidTTL(7)));
+    })
+    .await
+    .expect("async test timed out");
 }
 
 #[tokio::test]

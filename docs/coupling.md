@@ -22,31 +22,27 @@ We do **not** use runtime dependency injection patterns as a primary design appr
 
 ## How to Read This in Aurelia
 
-This document is **normative** for the coupling style we want in Aurelia. It is not limited to the
-current crate layout.
-
-The core library lives in `src/lib/` and the workspace contains a single crate. Read the current
-module boundaries as the present-day shape of boundaries that will continue to be decomposed into
-dedicated crates as they stabilize.
+This document is **normative** for the coupling style used in Aurelia. It applies across the
+current multi-crate workspace and to future modules or crates added to the repository.
 
 Apply this document like this:
 
-* when code is still inside one crate, keep the coupling aligned to the crate shape we want later
-* treat `src/lib/src/lib.rs` and any future `bin` crates as the composition edge
+* keep dependencies aligned with the workspace crate boundaries documented in `docs/aurelia.md`
+* treat crate roots, `src/lib/src/lib.rs`, and any future `bin` crates as composition edges
 * prefer narrow traits only where substitution and independent evolution are real needs
-* when a boundary is strong enough to stand on its own, decompose it into a dedicated workspace
-  crate under `src/crates/<crate-name>` and add matching docs under `docs/<crate-name>/`
+* when adding a new supporting crate under `src/crates/<crate-name>`, add matching docs under
+  `docs/<crate-name>/`
 
-This means the repository may not yet fully embody every rule below in all areas. The rules still
-define the intended direction and should guide refactors and new work.
+The rules below define how new work and refactors should preserve loose coupling in the current
+workspace structure.
 
 ## Repository Mapping
 
 To keep the guidance grounded in this repository:
 
-* `Cargo.toml` at the workspace root defines the member crates.
+* `Cargo.toml` at the workspace root defines the current member crates.
 * `src/lib/` is the main, publishable crate (`aurelia`).
-* Supporting crates live under `src/crates/<crate-name>/` and must be added to the workspace.
+* Supporting crates live under `src/crates/<crate-name>/` and are workspace members.
 * Crate-specific docs live under `docs/<crate-name>/`.
 * Composition edges live at crate roots (and at `bin` crates once they exist).
 
@@ -63,6 +59,11 @@ Rules:
   domain-neutral, in which case they belong in `common` or `shared`.
 * If a cross-domain concept emerges, it should become its own module or crate rather than being
   placed in `common` or `shared`.
+
+`aurelia-platform` is the explicit exception for cross-crate process services. It is reserved for
+platform invariants that must be shared by multiple internal crates, such as the singleton Aurelia
+runtime. It must not own domain contracts, domain data, logging policy, peering configuration,
+transport logic, test helpers, or general utility functions.
 
 ---
 
@@ -92,13 +93,6 @@ Rules:
   internal.
 * Consumers depend on contract crates, not on implementation crates.
 * Wiring happens at the edge of the program, typically in `main` or a bootstrap module.
-
-Aurelia note:
-
-* A boundary may begin life as a module inside `src/lib/src/`, but that should be treated as a
-  staging state, not the target architecture for strongly owned domains.
-
----
 
 ## 2. Traits define boundaries
 
@@ -368,6 +362,12 @@ Rules:
 * Implementation-specific internal types stay private to the implementation crate.
 
 This keeps contracts explicit and reduces incidental dependency spread.
+
+Public reporting structures are not an exception to this rule. Reports must not leak internal
+implementation enums or type aliases. Numeric report fields use the primitive value type, and
+internal enum values are converted to stable string labels through private `*_label` functions
+located next to the enum definition. Only deliberately supported domain contracts, such as
+`AureliaError` and `ErrorId`, should cross the public boundary as typed values.
 
 ---
 

@@ -4,32 +4,33 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::address::DomusAddr;
-use crate::auth::DomusAuthConfig;
+use crate::auth::Pkcs8AuthConfig;
 use crate::codec::MessageCodec;
-use crate::config::{DomusConfig, DomusConfigAccess, DomusConfigStore};
+use crate::config::{
+    normalize_domus_config_for_transport, DomusConfig, DomusConfigAccess, DomusConfigStore,
+};
 use crate::observability::{
     new_observability, DomusReporting, DomusReportingFeeds, ObservabilityHandle,
 };
-use crate::peering::{RouteLocalRemote, RouteLocalRemoteBuilder};
-use crate::routing::RouteResolver;
+use crate::peering::RouteLocalRemote;
 use crate::send::{SendOptions, SendOutcome};
 use crate::taberna::{Taberna, TabernaInboxHandle, TabernaRegistry, TabernaShutdownReport};
 use crate::transport::Transport;
+use aurelia_data::DomusAddr;
+use aurelia_data::RouteResolver;
 use aurelia_ids::{AureliaError, ErrorId, TabernaId};
 use caducus::MpscBuilder;
 
-type DomusPeering<RR> = RouteLocalRemote<RR>;
-type DomusTransport = Arc<Transport>;
+#[cfg(feature = "actix")]
+use crate::actix_adapter::{ActixTaberna, ActixTabernaDelivery};
 
 /// Builder for a [`Domus`].
 ///
 /// This is the low-level peering builder; most applications should construct
-/// a [`Domus`] via `Aurelia::domus_builder` instead, which wires the
-/// builder to Aurelia's owned Tokio runtime.
+/// a [`Domus`] via `Aurelia::domus_builder` instead.
 ///
 /// A [`DomusBuilder`] consumes a [`DomusConfig`], a local [`DomusAddr`],
 /// authentication material, and a [`RouteResolver`], then yields either a
@@ -38,42 +39,51 @@ type DomusTransport = Arc<Transport>;
 /// are required.
 pub struct DomusBuilder<RR>
 where
-    RR: RouteResolver,
+    RR: RouteResolver + 'static,
 {
     config: DomusConfig,
     local_addr: DomusAddr,
-    auth: DomusAuthConfig,
+    auth: Pkcs8AuthConfig,
     resolver: Arc<RR>,
     runtime_handle: tokio::runtime::Handle,
 }
 
 impl<RR> DomusBuilder<RR>
 where
-    RR: RouteResolver,
+    RR: RouteResolver + 'static,
 {
     /// Constructs a new builder. Callers normally reach this through
     /// `Aurelia::domus_builder` rather than directly.
     pub fn new(
         config: DomusConfig,
         local_addr: DomusAddr,
-        auth: DomusAuthConfig,
+        auth: Pkcs8AuthConfig,
         resolver: Arc<RR>,
-        runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             config,
             local_addr,
             auth,
             resolver,
-            runtime_handle,
+            runtime_handle: aurelia_platform::runtime::handle(),
         }
     }
 
     /// Builds a [`Domus`] without observability feeds. The transport is
     /// bound and started before this future resolves.
     pub async fn build(self) -> Result<Domus<RR>, AureliaError> {
-        let (domus, _) = self.build_internal(false).await?;
-        Ok(domus)
+        let (tx, rx) = oneshot::channel();
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let result = self.build_internal(false).await.map(|(domus, _)| domus);
+            let _ = tx.send(result);
+        });
+        rx.await.unwrap_or_else(|_| {
+            Err(AureliaError::with_message(
+                ErrorId::PeerUnavailable,
+                "aurelia runtime unavailable",
+            ))
+        })
     }
 
     /// Builds a [`Domus`] together with [`DomusReportingFeeds`] for
@@ -81,11 +91,26 @@ where
     pub async fn build_with_reporting(
         self,
     ) -> Result<(Domus<RR>, DomusReportingFeeds), AureliaError> {
-        let (domus, feeds) = self.build_internal(true).await?;
-        let feeds = feeds.ok_or_else(|| {
-            AureliaError::with_message(ErrorId::ProtocolViolation, "reporting feeds missing")
-        })?;
-        Ok((domus, feeds))
+        let (tx, rx) = oneshot::channel();
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let result = self.build_internal(true).await.and_then(|(domus, feeds)| {
+                let feeds = feeds.ok_or_else(|| {
+                    AureliaError::with_message(
+                        ErrorId::ProtocolViolation,
+                        "reporting feeds missing",
+                    )
+                })?;
+                Ok((domus, feeds))
+            });
+            let _ = tx.send(result);
+        });
+        rx.await.unwrap_or_else(|_| {
+            Err(AureliaError::with_message(
+                ErrorId::PeerUnavailable,
+                "aurelia runtime unavailable",
+            ))
+        })
     }
 
     async fn build_internal(
@@ -100,8 +125,7 @@ where
         } else {
             None
         };
-        let mut config = self.config;
-        config.apply_transport_defaults(self.local_addr.kind());
+        let config = normalize_domus_config_for_transport(self.config, self.local_addr.kind())?;
         let config = Arc::new(DomusConfigStore::new(config));
         let config_access =
             DomusConfigAccess::new(Arc::clone(&config), Some(observability.clone()));
@@ -116,13 +140,12 @@ where
             )
             .await?,
         );
-        let peering = RouteLocalRemoteBuilder::new(
+        let peering = RouteLocalRemote::new(
             config_access.clone(),
             Arc::clone(&registry),
             Arc::clone(&self.resolver),
             Arc::clone(&transport),
-        )
-        .build();
+        );
         let transport_handle = transport.start().await?;
         let domus = Domus {
             config: config_access,
@@ -148,39 +171,18 @@ where
 /// Construct one via `Aurelia::domus_builder` (recommended) or
 /// directly via `DomusBuilder`.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```no_run
-/// use std::sync::Arc;
-/// use aurelia::{Aurelia, DomusConfigBuilder, DomusAddr, DomusAuthConfig,
-///     Pkcs8AuthConfig, Pkcs8PemConfig, SimpleResolver};
-///
-/// # async fn example() -> Result<(), aurelia::AureliaError> {
-/// let aurelia = Aurelia::new();
-/// let config = DomusConfigBuilder::new().build()?;
-/// let auth = DomusAuthConfig::Pkcs8(Pkcs8AuthConfig::Pkcs8Pem(Pkcs8PemConfig {
-///     ca_pem: vec![], cert_pem: vec![], pkcs8_key_pem: vec![],
-/// }));
-/// let domus = aurelia
-///     .domus_builder(
-///         config,
-///         DomusAddr::Tcp("127.0.0.1:7000".parse().unwrap()),
-///         auth,
-///         Arc::new(SimpleResolver::new()),
-///     )
-///     .build()
-///     .await?;
-/// # let _ = domus.local_addr();
-/// # Ok(()) }
-/// ```
+/// Usage examples live in the main `aurelia` crate docs to ensure doctests
+/// compile at the library API level.
 pub struct Domus<RR>
 where
     RR: RouteResolver,
 {
     config: DomusConfigAccess,
     registry: Arc<TabernaRegistry>,
-    peering: DomusPeering<RR>,
-    transport: DomusTransport,
+    peering: RouteLocalRemote<RR>,
+    transport: Arc<Transport>,
     transport_handle: Mutex<Option<JoinHandle<()>>>,
     reporting: DomusReporting,
     observability: ObservabilityHandle,
@@ -242,6 +244,26 @@ where
         ))
     }
 
+    /// Registers an Actix-backed taberna on this domus.
+    ///
+    /// Requires the `actix` feature. This convenience path registers a normal
+    /// [`Taberna`] and runs an Actix-side bridge that forwards accepted taberna
+    /// requests to `recipient`.
+    #[cfg(feature = "actix")]
+    pub async fn actix_taberna<Codec>(
+        &self,
+        id: TabernaId,
+        codec: Codec,
+        recipient: actix::prelude::Recipient<ActixTabernaDelivery<Codec::AppMessage>>,
+    ) -> Result<ActixTaberna, AureliaError>
+    where
+        Codec: MessageCodec + 'static,
+        Codec::AppMessage: Send + Sync + 'static,
+    {
+        let taberna = self.taberna(id, codec).await?;
+        Ok(ActixTaberna::new(taberna, recipient))
+    }
+
     /// Sends `message` to the peer hosting `taberna_id`. Resolves the peer
     /// address through the configured [`RouteResolver`], then encodes the
     /// message via the supplied codec. With [`SendOptions::BLOB`] the
@@ -259,22 +281,22 @@ where
 
     /// Replaces the in-memory mTLS authentication material without
     /// restarting the domus. Useful for certificate rotation.
-    pub async fn reload_auth(&self, auth: DomusAuthConfig) -> Result<(), AureliaError> {
+    pub async fn reload_auth(&self, auth: Pkcs8AuthConfig) -> Result<(), AureliaError> {
         self.transport.reload_auth(auth).await?;
-        self.observability.auth_reloaded().await;
+        self.observability.auth_reloaded();
         Ok(())
     }
 
     /// Initiates a graceful shutdown: drains tabernas, closes the transport,
     /// and aborts the transport task.
     pub async fn shutdown(&self) {
-        self.observability.shutdown_started().await;
+        self.observability.shutdown_started();
         self.registry.shutdown().await;
         self.transport.shutdown().await;
         let handle = self.transport_handle.lock().await.take();
         if let Some(handle) = handle {
             handle.abort();
         }
-        self.observability.shutdown_complete().await;
+        self.observability.shutdown_complete();
     }
 }

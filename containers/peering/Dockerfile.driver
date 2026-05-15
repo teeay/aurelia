@@ -2,23 +2,16 @@
 # SPDX-FileCopyrightText: 2026 Zivatar Limited
 # SPDX-License-Identifier: Apache-2.0
 
-FROM rust:1-bookworm AS builder
-WORKDIR /workspace
-COPY . .
+ARG AURELIA_E2E_BUILDER_BASE=aurelia-e2e-builder-base:local
+ARG AURELIA_E2E_RUNTIME_BASE=aurelia-e2e-runtime-base:local
+
+FROM ${AURELIA_E2E_BUILDER_BASE} AS builder
+COPY --chown=appuser:appuser Cargo.toml Cargo.lock ./
+COPY --chown=appuser:appuser src ./src
+COPY --chown=appuser:appuser testing/peering/apps/peering-driver ./testing/peering/apps/peering-driver
 RUN cargo build --release --manifest-path testing/peering/apps/peering-driver/Cargo.toml
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        libcap2-bin \
-        iproute2 \
-        iputils-ping \
-    && setcap cap_net_admin+ep /sbin/tc \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
-
+FROM ${AURELIA_E2E_RUNTIME_BASE}
 COPY --from=builder /workspace/testing/peering/apps/peering-driver/target/release/peering-driver /usr/local/bin/peering-driver
 USER appuser
 ENTRYPOINT ["peering-driver"]

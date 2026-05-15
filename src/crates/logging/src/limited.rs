@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 pub type LogId = aurelia_ids::LogId;
-pub use aurelia_ids::log_ids;
 
 #[derive(Clone, Debug)]
 pub struct LimitedLogControl {
@@ -18,6 +17,12 @@ pub struct LimitedLogControl {
 }
 
 impl LimitedLogControl {
+    /// Updates the minimum interval between rate-limited log emissions.
+    ///
+    /// The interval is stored at seconds resolution: sub-second precision is
+    /// truncated. A `Duration` shorter than one second resolves to zero, which
+    /// disables throttling (every call to [`LimitedLogRegistry::should_log`]
+    /// returns `true`).
     pub fn set_interval(&self, interval: Duration) {
         let _ = self.interval_tx.send_replace(interval.as_secs());
     }
@@ -30,9 +35,9 @@ pub struct LimitedLogRegistry {
 }
 
 impl LimitedLogRegistry {
-    fn new(ids: &[LogId], interval_rx: watch::Receiver<u64>) -> Self {
-        let mut last_log = HashMap::with_capacity(ids.len());
-        for id in ids {
+    fn new(interval_rx: watch::Receiver<u64>) -> Self {
+        let mut last_log = HashMap::with_capacity(LogId::ALL.len());
+        for id in LogId::ALL {
             last_log.insert(*id, AtomicU64::new(0));
         }
         Self {
@@ -42,8 +47,12 @@ impl LimitedLogRegistry {
     }
 
     pub fn should_log(&self, id: LogId) -> bool {
+        // The registry is populated from `LogId::ALL` at construction, so
+        // every variant has an entry. The fallback below is dead in
+        // practice; if a future change drifts the invariant we allow the
+        // log through rather than panic or silently drop it.
         let Some(last) = self.last_log.get(&id) else {
-            return false;
+            return true;
         };
         let interval = *self.interval_rx.borrow();
         if interval == 0 {
@@ -70,9 +79,15 @@ pub struct LimitedLogContext {
 }
 
 impl LimitedLogContext {
-    pub fn new(ids: &[LogId], interval: Duration) -> Self {
+    /// Creates a new context with the given rate-limit interval.
+    ///
+    /// The interval is stored at seconds resolution: sub-second precision is
+    /// truncated. A `Duration` shorter than one second resolves to zero, which
+    /// disables throttling for the lifetime of the returned context (until
+    /// [`LimitedLogControl::set_interval`] is called with a non-zero value).
+    pub fn new(interval: Duration) -> Self {
         let (tx, rx) = watch::channel(interval.as_secs());
-        let registry = Arc::new(LimitedLogRegistry::new(ids, rx));
+        let registry = Arc::new(LimitedLogRegistry::new(rx));
         let control = LimitedLogControl { interval_tx: tx };
         Self { registry, control }
     }
@@ -86,8 +101,12 @@ impl LimitedLogContext {
     }
 }
 
-pub fn init_limited_logging(ids: &[LogId], interval: Duration) -> LimitedLogContext {
-    LimitedLogContext::new(ids, interval)
+/// Convenience constructor for [`LimitedLogContext`].
+///
+/// See [`LimitedLogContext::new`] for the seconds-resolution behaviour of
+/// the `interval` parameter.
+pub fn init_limited_logging(interval: Duration) -> LimitedLogContext {
+    LimitedLogContext::new(interval)
 }
 
 fn now_secs() -> u64 {
@@ -99,69 +118,46 @@ fn now_secs() -> u64 {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! info_limited {
-    ($registry:expr, $id:expr, $($arg:tt)+) => {{
+macro_rules! __limited_event {
+    ($level:expr, $registry:expr, $id:expr, $($arg:tt)+) => {{
         if $registry.should_log($id) {
-            tracing::info!(log_id = $id, $($arg)+);
+            tracing::event!($level, log_id = $id.as_u32(), $($arg)+);
         }
     }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! info_limited {
+    ($registry:expr, $id:expr, $($arg:tt)+) => {
+        $crate::__limited_event!(tracing::Level::INFO, $registry, $id, $($arg)+)
+    };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! warn_limited {
-    ($registry:expr, $id:expr, $($arg:tt)+) => {{
-        if $registry.should_log($id) {
-            tracing::warn!(log_id = $id, $($arg)+);
-        }
-    }};
+    ($registry:expr, $id:expr, $($arg:tt)+) => {
+        $crate::__limited_event!(tracing::Level::WARN, $registry, $id, $($arg)+)
+    };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! debug_limited {
-    ($registry:expr, $id:expr, $($arg:tt)+) => {{
-        if $registry.should_log($id) {
-            tracing::debug!(log_id = $id, $($arg)+);
-        }
-    }};
+    ($registry:expr, $id:expr, $($arg:tt)+) => {
+        $crate::__limited_event!(tracing::Level::DEBUG, $registry, $id, $($arg)+)
+    };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! error_limited {
-    ($registry:expr, $id:expr, $($arg:tt)+) => {{
-        if $registry.should_log($id) {
-            tracing::error!(log_id = $id, $($arg)+);
-        }
-    }};
+    ($registry:expr, $id:expr, $($arg:tt)+) => {
+        $crate::__limited_event!(tracing::Level::ERROR, $registry, $id, $($arg)+)
+    };
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limited_logging_blocks_within_interval() {
-        let (tx, rx) = watch::channel(120u64);
-        let registry = LimitedLogRegistry::new(&[log_ids::HANDSHAKE_TOTAL_LIMIT], rx);
-        let last = registry
-            .last_log
-            .get(&log_ids::HANDSHAKE_TOTAL_LIMIT)
-            .expect("log id");
-        last.store(now_secs().saturating_sub(240), Ordering::SeqCst);
-
-        assert!(registry.should_log(log_ids::HANDSHAKE_TOTAL_LIMIT));
-        assert!(!registry.should_log(log_ids::HANDSHAKE_TOTAL_LIMIT));
-
-        let _ = tx.send_replace(0);
-        assert!(registry.should_log(log_ids::HANDSHAKE_TOTAL_LIMIT));
-    }
-
-    #[test]
-    fn limited_logging_ignores_unknown_ids() {
-        let (_tx, rx) = watch::channel(120u64);
-        let registry = LimitedLogRegistry::new(&[log_ids::HANDSHAKE_TOTAL_LIMIT], rx);
-        assert!(!registry.should_log(9999));
-    }
-}
+#[path = "tests/limited.rs"]
+mod tests;

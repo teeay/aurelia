@@ -32,22 +32,31 @@ The peering end-to-end runner is the baseline network validation path and is exp
 
 ### Module Structure
 
-- `src/crates/peering/src/transport.rs`: public transport surface, wiring, and re-exports only.
+- `src/crates/peering/src/transport/mod.rs`: public transport surface, wiring, and re-exports only.
 - `src/crates/peering/src/transport/listener.rs`: TCP/TLS listener and inbound accept path.
 - `src/crates/peering/src/transport/peer.rs`: peer state mutation loop and snapshot access.
 - `src/crates/peering/src/transport/primary.rs`: primary callis reconnect/dial policy.
-- `src/crates/peering/src/transport/primary_dispatch.rs`: primary outbound dispatcher (queue + callis selection).
+- `src/crates/peering/src/transport/primary_dispatch.rs`: primary dispatch manager,
+  outbound-store integration, and immediate primary control handling.
+- `src/crates/peering/src/transport/primary_dispatch/store.rs`: non-concurrent primary outbound
+  store with bounded lanes, keyed lookup, replay state, and deadline indexing.
+- `src/crates/peering/src/transport/primary_dispatch/retained.rs`: async primary outbound store
+  wrapper, reclaimer wakeups, overrun reporting, and completion notification.
 - `src/crates/peering/src/transport/handshake.rs`: hello negotiation and inbound/outbound callis establishment.
 - `src/crates/peering/src/transport/frame.rs`: frame IO helpers and enqueue/dequeue helpers.
 - `src/crates/peering/src/transport/callis.rs`: callis tasks, `CallisHandle`, `OutboundFrame`.
 - `src/crates/peering/src/transport/tls.rs`: certificate/URI validation helpers.
 - `src/crates/peering/src/transport/blob/mod.rs`: blob subsystem façade, manager, retained frame tracking, and re-exports.
-- `src/crates/peering/src/transport/blob/dispatch.rs`: outbound blob scheduling and ACK coordination.
+- `src/crates/peering/src/transport/blob/outbound.rs`: outbound blob scheduling and ACK coordination.
 - `src/crates/peering/src/transport/blob/receive.rs`: inbound blob request/start/chunk handling.
 - `src/crates/peering/src/transport/tests/*.rs`: unit tests for transport logic, kept out of module files per `docs/testing.md`.
+- `src/crates/peering/src/observability/mod.rs`: observability facade, construction helpers, and re-exports.
+- `src/crates/peering/src/observability/actor.rs`: single-owner metrics, peer identity, and error-ring actor.
+- `src/crates/peering/src/observability/handle.rs`: internal observability producer handle.
+- `src/crates/peering/src/observability/reporting.rs`: public reporting handle and feed subscriptions.
+- `src/crates/peering/src/observability/types.rs`: public reporting event and metrics types.
 - `src/crates/peering/src/peering/mod.rs`: internal peering API surface and re-exports.
 - `src/crates/peering/src/peering/dispatch.rs`: routing + remote dispatch (facade is routing, not wire send).
-- `src/crates/peering/src/peering/builder.rs`: `RouteLocalRemoteBuilder` setup and configuration.
 - `src/crates/peering/src/domus.rs`: Domus public API surface and wiring.
 - `src/crates/peering/src/delivery.rs`: local delivery to taberna sinks and stream sinks (shared by dispatch paths and transport receive).
 
@@ -65,7 +74,7 @@ The peering end-to-end runner is the baseline network validation path and is exp
   - non-blob inbound frames call `PeerSession::receive_message` (which delegates to `delivery.rs`)
   - blob inbound frames call `delivery.rs` directly (stream sink handling bypasses `PeerSession`)
 - Peering dispatch boundaries:
-  - `peering/dispatch.rs` handles routing + remote dispatch for non-blob sends; blob dispatch lives in `transport/blob/dispatch.rs`
+  - `peering/dispatch.rs` handles routing + remote dispatch for non-blob sends; blob dispatch lives in `transport/blob/outbound.rs`
   - local delivery in these paths calls into `delivery.rs` (no duplicated sink logic)
 - `src/crates/peering/src/session.rs`: inbound receive, dedupe, and ACK handling (kept as-is unless split later).
 
@@ -99,7 +108,6 @@ Peer roles are `listener` and `originator`. All peers start as listeners.
 - `docs/peering/e2e-tests.md`: peering-specific end-to-end scenarios and plan.
 - `docs/peering/socket-transport.md`: socket transport backend and A0 authentication.
 - `docs/peering/tcp-transport.md`: TCP transport backend and A0 authentication.
-- `docs/peering/simple-resolver.md`: map-based resolver for higher-level integrations.
 
 ### Logging Requirements
 
@@ -108,6 +116,8 @@ Peer roles are `listener` and `originator`. All peers start as listeners.
 ### Cross-Cutting References
 
 - `docs/ids.md` is the gold source for ID definitions used by the peering crate.
+- `docs/resolver/simple-resolver.md` defines the reusable map-based
+  `RouteResolver` implementation.
 
 <!--
 This file is part of the Aurelia workspace.
